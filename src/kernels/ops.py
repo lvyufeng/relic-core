@@ -18,9 +18,11 @@ _FUSED_DECODE_ATTN_CUDA = os.getenv("DEEPSEEK_FUSED_DECODE_ATTN_CUDA", "0").lowe
 _TENSOR_CORE_ATTN = os.getenv("DEEPSEEK_TENSOR_CORE_ATTN", "0").lower() in {"1", "true", "yes"}
 _TENSOR_CORE_ATTN_CUDA = os.getenv("DEEPSEEK_TENSOR_CORE_ATTN_CUDA", "0").lower() in {"1", "true", "yes"}
 _FLASHINFER_STYLE_ATTN_CUDA = os.getenv("DEEPSEEK_FLASHINFER_STYLE_ATTN_CUDA", "0").lower() in {"1", "true", "yes"}
+_FLASHINFER_STYLE_ATTN_HEADPAIR_CUDA = os.getenv("DEEPSEEK_FLASHINFER_STYLE_ATTN_HEADPAIR_CUDA", "0").lower() in {"1", "true", "yes"}
 _PREFILL_SPARSE_ATTN_CUDA = os.getenv("DEEPSEEK_PREFILL_SPARSE_ATTN_CUDA", "1").lower() in {"1", "true", "yes"}
 _PREFILL_SPARSE_ATTN_HEADPAIR_CUDA = os.getenv("DEEPSEEK_PREFILL_SPARSE_ATTN_HEADPAIR_CUDA", "1").lower() in {"1", "true", "yes"}
 _SHARED_EXPERT_PAIR_INT8_CUDA = os.getenv("DEEPSEEK_SHARED_EXPERT_PAIR_INT8_CUDA", "0").lower() in {"1", "true", "yes"}
+_Q8_0_CUDA_EXT = os.getenv("DEEPSEEK_Q8_0_CUDA_EXT", "1").lower() in {"1", "true", "yes"}
 _INT8_CUDA_EXT = None
 
 
@@ -729,6 +731,68 @@ if _USE_TRITON:
         tl.store(y_ptrs, y, mask=y_mask)
 
 
+def q8_0_weight_dequantize(blocks: torch.Tensor, row_elems: int | None = None) -> torch.Tensor:
+    assert blocks.dtype == torch.uint8 and blocks.dim() == 3 and blocks.size(-1) == 34
+    scales = blocks[:, :, :2].contiguous().view(torch.float16).squeeze(-1).to(torch.float32)
+    qs = blocks[:, :, 2:34].contiguous().view(torch.int8).to(torch.float32)
+    weight = (qs * scales.unsqueeze(-1)).reshape(blocks.size(0), -1)
+    if row_elems is not None:
+        weight = weight[:, :row_elems]
+    return weight.contiguous()
+
+
+def q8_0_weight_gemm_cuda_ext(
+    x: torch.Tensor,
+    blocks: torch.Tensor,
+    *,
+    row_elems: int,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    global _INT8_CUDA_EXT
+    if _INT8_CUDA_EXT is None:
+        _INT8_CUDA_EXT = load_cuda_kernel()
+    if _INT8_CUDA_EXT is None or not hasattr(_INT8_CUDA_EXT, "q8_0_gemm_forward"):
+        raise RuntimeError("Q8_0 CUDA extension is unavailable")
+    y = _INT8_CUDA_EXT.q8_0_gemm_forward(
+        x.contiguous(),
+        blocks.contiguous(),
+        int(row_elems),
+    )
+    if out_dtype is None:
+        out_dtype = torch.get_default_dtype()
+    return y.to(out_dtype)
+
+
+def q8_0_weight_gemm(
+    x: torch.Tensor,
+    blocks: torch.Tensor,
+    *,
+    row_elems: int | None = None,
+    chunk_rows: int = 0,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    assert blocks.dtype == torch.uint8 and blocks.dim() == 3 and blocks.size(-1) == 34
+    row_elems = int(blocks.size(1) * 32 if row_elems is None else row_elems)
+    flat_m = x.numel() // x.shape[-1]
+    if _Q8_0_CUDA_EXT and x.is_cuda and blocks.is_cuda and flat_m <= 2:
+        try:
+            return q8_0_weight_gemm_cuda_ext(x, blocks, row_elems=row_elems, out_dtype=out_dtype)
+        except Exception:
+            pass
+    flat = x.reshape(-1, x.shape[-1]).to(torch.float32).contiguous()
+    out_features = blocks.size(0)
+    chunk_rows = out_features if chunk_rows <= 0 else int(chunk_rows)
+    out = torch.empty((flat.size(0), out_features), device=flat.device, dtype=torch.float32)
+    for start in range(0, out_features, chunk_rows):
+        end = min(start + chunk_rows, out_features)
+        weight = q8_0_weight_dequantize(blocks[start:end], row_elems=row_elems)
+        out[:, start:end].copy_(torch.nn.functional.linear(flat, weight, None))
+    if out_dtype is None:
+        out_dtype = torch.get_default_dtype()
+    return out.view(*x.shape[:-1], out_features).to(out_dtype)
+
+
+
 def soft_bf16_weight_gemm_int8_torch(
     x: torch.Tensor,
     weight_q: torch.Tensor,
@@ -1087,6 +1151,17 @@ def sparse_attn(
             )
         if _INT8_CUDA_EXT is not None and hasattr(_INT8_CUDA_EXT, "prefill_sparse_attn_forward"):
             return _INT8_CUDA_EXT.prefill_sparse_attn_forward(
+                q.contiguous(),
+                kv.contiguous(),
+                attn_sink.contiguous(),
+                topk_idxs.contiguous().to(torch.int32),
+                float(softmax_scale),
+            )
+    if _FLASHINFER_STYLE_ATTN_HEADPAIR_CUDA and q.is_cuda and q.size(1) == 1 and q.size(-1) == 512 and topk_idxs.size(-1) <= 256:
+        if _INT8_CUDA_EXT is None:
+            _INT8_CUDA_EXT = load_cuda_kernel()
+        if _INT8_CUDA_EXT is not None and hasattr(_INT8_CUDA_EXT, "flashinfer_style_sparse_attn_headpair_forward"):
+            return _INT8_CUDA_EXT.flashinfer_style_sparse_attn_headpair_forward(
                 q.contiguous(),
                 kv.contiguous(),
                 attn_sink.contiguous(),

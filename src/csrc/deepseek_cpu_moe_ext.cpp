@@ -170,7 +170,370 @@ static inline float silu_scalar(float x) {
     return x / (1.0f + std::exp(-x));
 }
 
+static inline uint16_t load_le16(const uint8_t* p) {
+    return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+}
 
+static inline uint32_t load_le32(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0])
+        | (static_cast<uint32_t>(p[1]) << 8)
+        | (static_cast<uint32_t>(p[2]) << 16)
+        | (static_cast<uint32_t>(p[3]) << 24);
+}
+
+static inline float fp16_to_float(uint16_t h) {
+    const bool negative = (h & 0x8000) != 0;
+    const int exp = (h >> 10) & 0x1f;
+    const uint32_t mant = h & 0x03ff;
+    if (exp == 0) {
+        if (mant == 0) return negative ? -0.0f : 0.0f;
+        const float value = std::ldexp(static_cast<float>(mant), -24);
+        return negative ? -value : value;
+    }
+    const uint32_t sign = static_cast<uint32_t>(h & 0x8000) << 16;
+    uint32_t out;
+    if (exp == 31) {
+        out = sign | 0x7f800000 | (mant << 13);
+    } else {
+        out = sign | (static_cast<uint32_t>(exp + 127 - 15) << 23) | (mant << 13);
+    }
+    float value;
+    std::memcpy(&value, &out, sizeof(value));
+    return value;
+}
+
+static inline float hsum256_ps(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 sum = _mm_add_ps(lo, hi);
+    sum = _mm_hadd_ps(sum, sum);
+    sum = _mm_hadd_ps(sum, sum);
+    return _mm_cvtss_f32(sum);
+}
+
+static inline float dot8_i8_f32_avx2(const float* x, const int8_t* vals, float scale) {
+    const __m128i v8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(vals));
+    const __m256i v32 = _mm256_cvtepi8_epi32(v8);
+    const __m256 vf = _mm256_cvtepi32_ps(v32);
+    return scale * hsum256_ps(_mm256_mul_ps(_mm256_loadu_ps(x), vf));
+}
+
+static inline void dot8_i8_f32_avx2_pair(const float* x, const int8_t* vals0, const int8_t* vals1, float scale0, float scale1, float* acc0, float* acc1) {
+    const __m256 x_vec = _mm256_loadu_ps(x);
+    const __m128i v8_0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(vals0));
+    const __m128i v8_1 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(vals1));
+    const __m256 vf0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v8_0));
+    const __m256 vf1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v8_1));
+    const __m256 scaled0 = _mm256_mul_ps(_mm256_mul_ps(x_vec, vf0), _mm256_set1_ps(scale0));
+    const __m256 scaled1 = _mm256_mul_ps(_mm256_mul_ps(x_vec, vf1), _mm256_set1_ps(scale1));
+    *acc0 += hsum256_ps(scaled0);
+    *acc1 += hsum256_ps(scaled1);
+}
+
+static inline float dot16_q2_f32_avx2(const float* x, const uint8_t* qbytes, int shift, float qscale, float base) {
+    const __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qbytes));
+    const __m128i shifted = _mm_and_si128(_mm_srli_epi16(raw, shift), _mm_set1_epi8(0x03));
+    const __m256 q_lo = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(shifted));
+    const __m256 q_hi = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(shifted, 8)));
+    const __m256 x_lo = _mm256_loadu_ps(x);
+    const __m256 x_hi = _mm256_loadu_ps(x + 8);
+    const float xq_sum = hsum256_ps(_mm256_mul_ps(x_lo, q_lo)) + hsum256_ps(_mm256_mul_ps(x_hi, q_hi));
+    const float x_sum = hsum256_ps(x_lo) + hsum256_ps(x_hi);
+    return qscale * xq_sum - base * x_sum;
+}
+
+static inline void dot16_q2_f32_avx2_pair(
+    const float* x,
+    const uint8_t* qbytes0,
+    const uint8_t* qbytes1,
+    int shift,
+    float qscale0,
+    float base0,
+    float qscale1,
+    float base1,
+    float* acc0,
+    float* acc1)
+{
+    const __m256 x_lo = _mm256_loadu_ps(x);
+    const __m256 x_hi = _mm256_loadu_ps(x + 8);
+    const __m256 x_sum_vec = _mm256_add_ps(x_lo, x_hi);
+
+    const __m128i raw0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qbytes0));
+    const __m128i shifted0 = _mm_and_si128(_mm_srli_epi16(raw0, shift), _mm_set1_epi8(0x03));
+    const __m256 q0_lo = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(shifted0));
+    const __m256 q0_hi = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(shifted0, 8)));
+    const __m256 acc0_vec = _mm256_sub_ps(
+        _mm256_mul_ps(_mm256_add_ps(_mm256_mul_ps(x_lo, q0_lo), _mm256_mul_ps(x_hi, q0_hi)), _mm256_set1_ps(qscale0)),
+        _mm256_mul_ps(x_sum_vec, _mm256_set1_ps(base0)));
+    *acc0 += hsum256_ps(acc0_vec);
+
+    const __m128i raw1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qbytes1));
+    const __m128i shifted1 = _mm_and_si128(_mm_srli_epi16(raw1, shift), _mm_set1_epi8(0x03));
+    const __m256 q1_lo = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(shifted1));
+    const __m256 q1_hi = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(shifted1, 8)));
+    const __m256 acc1_vec = _mm256_sub_ps(
+        _mm256_mul_ps(_mm256_add_ps(_mm256_mul_ps(x_lo, q1_lo), _mm256_mul_ps(x_hi, q1_hi)), _mm256_set1_ps(qscale1)),
+        _mm256_mul_ps(x_sum_vec, _mm256_set1_ps(base1)));
+    *acc1 += hsum256_ps(acc1_vec);
+}
+
+static inline float gguf_q2_k_dot(const float* x, const uint8_t* row, long long blocks_per_row) {
+    float acc = 0.0f;
+    for (long long block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
+        const uint8_t* block = row + block_idx * 84;
+        const uint8_t* scales = block;
+        const uint8_t* qs = block + 16;
+        const float d = fp16_to_float(load_le16(block + 80));
+        const float dmin = fp16_to_float(load_le16(block + 82));
+        const long long k_base = block_idx * 256;
+        for (int group = 0; group < 16; ++group) {
+            const int half_block = group / 8;
+            const int group_in_half = group % 8;
+            const int shift = (group_in_half / 2) * 2;
+            const int byte_start = half_block * 32 + (group_in_half % 2) * 16;
+            const float scale = static_cast<float>(scales[group] & 0x0f);
+            const float minv = static_cast<float>(scales[group] >> 4);
+            const float base = dmin * minv;
+            const long long k_group = k_base + group * 16;
+            acc += dot16_q2_f32_avx2(x + k_group, qs + byte_start, shift, d * scale, base);
+        }
+    }
+    return acc;
+}
+
+static inline void gguf_q2_k_dot_pair(
+    const float* x,
+    const uint8_t* row0,
+    const uint8_t* row1,
+    long long blocks_per_row,
+    float* out0,
+    float* out1)
+{
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (long long block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
+        const uint8_t* block0 = row0 + block_idx * 84;
+        const uint8_t* block1 = row1 + block_idx * 84;
+        const uint8_t* scales0 = block0;
+        const uint8_t* scales1 = block1;
+        const uint8_t* qs0 = block0 + 16;
+        const uint8_t* qs1 = block1 + 16;
+        const float d0 = fp16_to_float(load_le16(block0 + 80));
+        const float dmin0 = fp16_to_float(load_le16(block0 + 82));
+        const float d1 = fp16_to_float(load_le16(block1 + 80));
+        const float dmin1 = fp16_to_float(load_le16(block1 + 82));
+        const long long k_base = block_idx * 256;
+        for (int group = 0; group < 16; ++group) {
+            const int half_block = group / 8;
+            const int group_in_half = group % 8;
+            const int shift = (group_in_half / 2) * 2;
+            const int byte_start = half_block * 32 + (group_in_half % 2) * 16;
+            const float scale0 = static_cast<float>(scales0[group] & 0x0f);
+            const float minv0 = static_cast<float>(scales0[group] >> 4);
+            const float scale1 = static_cast<float>(scales1[group] & 0x0f);
+            const float minv1 = static_cast<float>(scales1[group] >> 4);
+            const long long k_group = k_base + group * 16;
+            dot16_q2_f32_avx2_pair(
+                x + k_group,
+                qs0 + byte_start,
+                qs1 + byte_start,
+                shift,
+                d0 * scale0,
+                dmin0 * minv0,
+                d1 * scale1,
+                dmin1 * minv1,
+                &acc0,
+                &acc1);
+        }
+    }
+    *out0 = acc0;
+    *out1 = acc1;
+}
+
+static inline float gguf_iq2_xxs_dot(const float* x, const uint8_t* row, long long blocks_per_row, const int8_t* signed_grid) {
+    float acc = 0.0f;
+    for (long long block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
+        const uint8_t* block = row + block_idx * 66;
+        const float d = fp16_to_float(load_le16(block));
+        const uint8_t* qs = block + 2;
+        const long long k_base = block_idx * 256;
+        for (int sub = 0; sub < 8; ++sub) {
+            const uint8_t* chunk = qs + sub * 8;
+            const uint32_t aux1 = load_le32(chunk + 4);
+            const float ls = static_cast<float>(2 * (aux1 >> 28) + 1);
+            for (int part = 0; part < 4; ++part) {
+                const int grid_id = static_cast<int>(chunk[part]);
+                const int sign_idx = static_cast<int>((aux1 >> (7 * part)) & 127);
+                const int8_t* vals = signed_grid + ((grid_id * 128 + sign_idx) * 8);
+                const long long k_start = k_base + sub * 32 + part * 8;
+                const float scale = 0.125f * d * ls;
+                acc += dot8_i8_f32_avx2(x + k_start, vals, scale);
+            }
+        }
+    }
+    return acc;
+}
+
+
+static inline float gguf_quant_dot(int64_t type_id, const float* x, const uint8_t* row, long long blocks_per_row, const int8_t* signed_grid) {
+    if (type_id == 0) {
+        return gguf_iq2_xxs_dot(x, row, blocks_per_row, signed_grid);
+    }
+    return gguf_q2_k_dot(x, row, blocks_per_row);
+}
+
+
+static inline void gguf_iq2_xxs_dot_pair(
+    const float* x,
+    const uint8_t* row0,
+    const uint8_t* row1,
+    long long blocks_per_row,
+    const int8_t* signed_grid,
+    float* out0,
+    float* out1)
+{
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (long long block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
+        const uint8_t* block0 = row0 + block_idx * 66;
+        const uint8_t* block1 = row1 + block_idx * 66;
+        const float d0 = fp16_to_float(load_le16(block0));
+        const float d1 = fp16_to_float(load_le16(block1));
+        const uint8_t* qs0 = block0 + 2;
+        const uint8_t* qs1 = block1 + 2;
+        const long long k_base = block_idx * 256;
+        for (int sub = 0; sub < 8; ++sub) {
+            const uint8_t* chunk0 = qs0 + sub * 8;
+            const uint8_t* chunk1 = qs1 + sub * 8;
+            const uint32_t aux0 = load_le32(chunk0 + 4);
+            const uint32_t aux1 = load_le32(chunk1 + 4);
+            const float ls0 = static_cast<float>(2 * (aux0 >> 28) + 1);
+            const float ls1 = static_cast<float>(2 * (aux1 >> 28) + 1);
+            for (int part = 0; part < 4; ++part) {
+                const int grid_id0 = static_cast<int>(chunk0[part]);
+                const int sign_idx0 = static_cast<int>((aux0 >> (7 * part)) & 127);
+                const int8_t* vals0 = signed_grid + ((grid_id0 * 128 + sign_idx0) * 8);
+                const int grid_id1 = static_cast<int>(chunk1[part]);
+                const int sign_idx1 = static_cast<int>((aux1 >> (7 * part)) & 127);
+                const int8_t* vals1 = signed_grid + ((grid_id1 * 128 + sign_idx1) * 8);
+                const long long k_start = k_base + sub * 32 + part * 8;
+                dot8_i8_f32_avx2_pair(
+                    x + k_start,
+                    vals0,
+                    vals1,
+                    0.125f * d0 * ls0,
+                    0.125f * d1 * ls1,
+                    &acc0,
+                    &acc1);
+            }
+        }
+    }
+    *out0 = acc0;
+    *out1 = acc1;
+}
+
+static inline void gguf_quant_dot_pair(
+    int64_t type_id0,
+    int64_t type_id1,
+    const float* x,
+    const uint8_t* row0,
+    const uint8_t* row1,
+    long long blocks_per_row,
+    const int8_t* signed_grid,
+    float* out0,
+    float* out1)
+{
+    if (type_id0 == type_id1) {
+        if (type_id0 == 0) {
+            gguf_iq2_xxs_dot_pair(x, row0, row1, blocks_per_row, signed_grid, out0, out1);
+            return;
+        }
+        gguf_q2_k_dot_pair(x, row0, row1, blocks_per_row, out0, out1);
+        return;
+    }
+    *out0 = gguf_quant_dot(type_id0, x, row0, blocks_per_row, signed_grid);
+    *out1 = gguf_quant_dot(type_id1, x, row1, blocks_per_row, signed_grid);
+}
+
+static inline void dot8_i8_f32_avx2_batch4(const float* x, long long stride, int count, const int8_t* vals, float scale, float* acc) {
+    const __m128i v8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(vals));
+    const __m256 vf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v8));
+    const __m256 scale_v = _mm256_set1_ps(scale);
+    for (int i = 0; i < count; ++i) {
+        acc[i] += hsum256_ps(_mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(x + i * stride), vf), scale_v));
+    }
+}
+
+static inline void dot16_q2_f32_avx2_batch4(const float* x, long long stride, int count, const uint8_t* qbytes, int shift, float qscale, float base, float* acc) {
+    const __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qbytes));
+    const __m128i shifted = _mm_and_si128(_mm_srli_epi16(raw, shift), _mm_set1_epi8(0x03));
+    const __m256 q_lo = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(shifted));
+    const __m256 q_hi = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(shifted, 8)));
+    const __m256 qscale_v = _mm256_set1_ps(qscale);
+    const __m256 base_v = _mm256_set1_ps(base);
+    for (int i = 0; i < count; ++i) {
+        const float* xi = x + i * stride;
+        const __m256 x_lo = _mm256_loadu_ps(xi);
+        const __m256 x_hi = _mm256_loadu_ps(xi + 8);
+        const __m256 x_sum_vec = _mm256_add_ps(x_lo, x_hi);
+        const __m256 xq_vec = _mm256_add_ps(_mm256_mul_ps(x_lo, q_lo), _mm256_mul_ps(x_hi, q_hi));
+        const __m256 acc_vec = _mm256_sub_ps(_mm256_mul_ps(xq_vec, qscale_v), _mm256_mul_ps(x_sum_vec, base_v));
+        acc[i] += hsum256_ps(acc_vec);
+    }
+}
+
+static inline void gguf_q2_k_dot_batch4(const float* x, long long stride, int count, const uint8_t* row, long long blocks_per_row, float* out) {
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (long long block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
+        const uint8_t* block = row + block_idx * 84;
+        const uint8_t* scales = block;
+        const uint8_t* qs = block + 16;
+        const float d = fp16_to_float(load_le16(block + 80));
+        const float dmin = fp16_to_float(load_le16(block + 82));
+        const long long k_base = block_idx * 256;
+        for (int group = 0; group < 16; ++group) {
+            const int half_block = group / 8;
+            const int group_in_half = group % 8;
+            const int shift = (group_in_half / 2) * 2;
+            const int byte_start = half_block * 32 + (group_in_half % 2) * 16;
+            const float scale = static_cast<float>(scales[group] & 0x0f);
+            const float minv = static_cast<float>(scales[group] >> 4);
+            dot16_q2_f32_avx2_batch4(x + k_base + group * 16, stride, count, qs + byte_start, shift, d * scale, dmin * minv, acc);
+        }
+    }
+    for (int i = 0; i < count; ++i) out[i] = acc[i];
+}
+
+static inline void gguf_iq2_xxs_dot_batch4(const float* x, long long stride, int count, const uint8_t* row, long long blocks_per_row, const int8_t* signed_grid, float* out) {
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (long long block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
+        const uint8_t* block = row + block_idx * 66;
+        const float d = fp16_to_float(load_le16(block));
+        const uint8_t* qs = block + 2;
+        const long long k_base = block_idx * 256;
+        for (int sub = 0; sub < 8; ++sub) {
+            const uint8_t* chunk = qs + sub * 8;
+            const uint32_t aux1 = load_le32(chunk + 4);
+            const float ls = static_cast<float>(2 * (aux1 >> 28) + 1);
+            for (int part = 0; part < 4; ++part) {
+                const int grid_id = static_cast<int>(chunk[part]);
+                const int sign_idx = static_cast<int>((aux1 >> (7 * part)) & 127);
+                const int8_t* vals = signed_grid + ((grid_id * 128 + sign_idx) * 8);
+                const long long k_start = k_base + sub * 32 + part * 8;
+                dot8_i8_f32_avx2_batch4(x + k_start, stride, count, vals, 0.125f * d * ls, acc);
+            }
+        }
+    }
+    for (int i = 0; i < count; ++i) out[i] = acc[i];
+}
+
+static inline void gguf_quant_dot_batch4(int64_t type_id, const float* x, long long stride, int count, const uint8_t* row, long long blocks_per_row, const int8_t* signed_grid, float* out) {
+    if (type_id == 0) {
+        gguf_iq2_xxs_dot_batch4(x, stride, count, row, blocks_per_row, signed_grid, out);
+    } else {
+        gguf_q2_k_dot_batch4(x, stride, count, row, blocks_per_row, out);
+    }
+}
 
 static inline int32_t dot_i8_avx2(const int8_t* a, const int8_t* b, long long n) {
     const __m256i ones = _mm256_set1_epi16(1);
@@ -1129,15 +1492,6 @@ static inline __m256 decode_fp4_nibbles8_to_ps(__m128i nibbles) {
     const __m256i decoded_i32 = _mm256_cvtepi8_epi32(decoded_i8);
     const __m256 decoded = _mm256_cvtepi32_ps(decoded_i32);
     return _mm256_mul_ps(decoded, _mm256_set1_ps(0.5f));
-}
-
-static inline float hsum256_ps(__m256 v) {
-    __m128 lo = _mm256_castps256_ps128(v);
-    __m128 hi = _mm256_extractf128_ps(v, 1);
-    __m128 sum = _mm_add_ps(lo, hi);
-    sum = _mm_hadd_ps(sum, sum);
-    sum = _mm_hadd_ps(sum, sum);
-    return _mm_cvtss_f32(sum);
 }
 
 static void fused_fp4_w13_hidden_range(
@@ -2402,6 +2756,257 @@ static PyObject* cpu_moe_server_loop_int8_v2(PyObject*, PyObject* args) {
 }
 
 
+static PyObject* gguf_routes_forward(PyObject*, PyObject* args) {
+    unsigned long long input_ptr_ull, route_tokens_ptr_ull, route_weights_ptr_ull, output_ptr_ull;
+    unsigned long long w1_ptrs_ull, w3_ptrs_ull, w2_ptrs_ull, grid_ptr_ull;
+    long long route_count, tokens, hidden_dim, inter_dim;
+    long long w1_bpr, w1_block_bytes, w1_type;
+    long long w3_bpr, w3_block_bytes, w3_type;
+    long long w2_bpr, w2_block_bytes, w2_type;
+    float swiglu_limit;
+    if (!PyArg_ParseTuple(
+            args,
+            "KKKKLLLLKKKLLLLLLLLLfK",
+            &input_ptr_ull,
+            &route_tokens_ptr_ull,
+            &route_weights_ptr_ull,
+            &output_ptr_ull,
+            &route_count,
+            &tokens,
+            &hidden_dim,
+            &inter_dim,
+            &w1_ptrs_ull,
+            &w3_ptrs_ull,
+            &w2_ptrs_ull,
+            &w1_bpr,
+            &w1_block_bytes,
+            &w1_type,
+            &w3_bpr,
+            &w3_block_bytes,
+            &w3_type,
+            &w2_bpr,
+            &w2_block_bytes,
+            &w2_type,
+            &swiglu_limit,
+            &grid_ptr_ull)) {
+        return nullptr;
+    }
+    auto* input = reinterpret_cast<const float*>(input_ptr_ull);
+    auto* route_tokens = reinterpret_cast<const int64_t*>(route_tokens_ptr_ull);
+    auto* route_weights = reinterpret_cast<const float*>(route_weights_ptr_ull);
+    auto* output = reinterpret_cast<float*>(output_ptr_ull);
+    auto* w1_ptrs = reinterpret_cast<const int64_t*>(w1_ptrs_ull);
+    auto* w3_ptrs = reinterpret_cast<const int64_t*>(w3_ptrs_ull);
+    auto* w2_ptrs = reinterpret_cast<const int64_t*>(w2_ptrs_ull);
+    auto* grid = reinterpret_cast<const int8_t*>(grid_ptr_ull);
+
+    Py_BEGIN_ALLOW_THREADS
+    apply_omp_runtime_config();
+    std::fill(output, output + tokens * hidden_dim, 0.0f);
+    if (route_count > 0) {
+        std::vector<float> hidden(route_count * inter_dim);
+        #pragma omp parallel for schedule(static)
+        for (long long ro = 0; ro < route_count * inter_dim; ++ro) {
+            const long long route = ro / inter_dim;
+            const long long o = ro - route * inter_dim;
+            const long long token = route_tokens[route];
+            const float* x_row = input + token * hidden_dim;
+            const auto* w1_blocks = reinterpret_cast<const uint8_t*>(w1_ptrs[route]);
+            const auto* w3_blocks = reinterpret_cast<const uint8_t*>(w3_ptrs[route]);
+            const uint8_t* w1_row = w1_blocks + o * w1_bpr * w1_block_bytes;
+            const uint8_t* w3_row = w3_blocks + o * w3_bpr * w3_block_bytes;
+            float gate;
+            float up;
+            if (w1_bpr == w3_bpr && w1_block_bytes == w3_block_bytes) {
+                gguf_quant_dot_pair(w1_type, w3_type, x_row, w1_row, w3_row, w1_bpr, grid, &gate, &up);
+            } else {
+                gate = gguf_quant_dot(w1_type, x_row, w1_row, w1_bpr, grid);
+                up = gguf_quant_dot(w3_type, x_row, w3_row, w3_bpr, grid);
+            }
+            if (swiglu_limit > 0.0f) {
+                up = std::max(-swiglu_limit, std::min(swiglu_limit, up));
+                gate = std::min(swiglu_limit, gate);
+            }
+            hidden[ro] = route_weights[route] * silu_scalar(gate) * up;
+        }
+        if (tokens == 1) {
+            #pragma omp parallel for schedule(static)
+            for (long long o = 0; o < hidden_dim; ++o) {
+                float acc = 0.0f;
+                for (long long route = 0; route < route_count; ++route) {
+                    const float* hidden_row = hidden.data() + route * inter_dim;
+                    const auto* w2_blocks = reinterpret_cast<const uint8_t*>(w2_ptrs[route]);
+                    const uint8_t* w2_row = w2_blocks + o * w2_bpr * w2_block_bytes;
+                    acc += gguf_quant_dot(w2_type, hidden_row, w2_row, w2_bpr, grid);
+                }
+                output[o] = acc;
+            }
+        } else {
+            std::vector<long long> token_route_offsets(tokens + 1, 0);
+            long long route = 0;
+            for (long long token = 0; token < tokens; ++token) {
+                token_route_offsets[token] = route;
+                while (route < route_count && route_tokens[route] == token) {
+                    ++route;
+                }
+            }
+            token_route_offsets[tokens] = route_count;
+            #pragma omp parallel for schedule(static)
+            for (long long th = 0; th < tokens * hidden_dim; ++th) {
+                const long long token = th / hidden_dim;
+                const long long o = th - token * hidden_dim;
+                float acc = 0.0f;
+                const long long route_begin = token_route_offsets[token];
+                const long long route_end = token_route_offsets[token + 1];
+                for (long long route_idx = route_begin; route_idx < route_end; ++route_idx) {
+                    const float* hidden_row = hidden.data() + route_idx * inter_dim;
+                    const auto* w2_blocks = reinterpret_cast<const uint8_t*>(w2_ptrs[route_idx]);
+                    const uint8_t* w2_row = w2_blocks + o * w2_bpr * w2_block_bytes;
+                    acc += gguf_quant_dot(w2_type, hidden_row, w2_row, w2_bpr, grid);
+                }
+                output[th] = acc;
+            }
+        }
+    }
+    Py_END_ALLOW_THREADS
+    Py_RETURN_NONE;
+}
+
+
+static PyObject* gguf_expert_forward(PyObject*, PyObject* args) {
+    unsigned long long x_ptr_ull, weight_ptr_ull, out_ptr_ull;
+    unsigned long long w1_blocks_ull, w3_blocks_ull, w2_blocks_ull, grid_ptr_ull;
+    long long tokens, hidden_dim, inter_dim, w1_bpr, w1_block_bytes, w1_type;
+    long long w3_bpr, w3_block_bytes, w3_type, w2_bpr, w2_block_bytes, w2_type;
+    float swiglu_limit;
+    if (!PyArg_ParseTuple(
+            args,
+            "KKKKKKLLLLLLLLLLLLfK",
+            &x_ptr_ull,
+            &weight_ptr_ull,
+            &out_ptr_ull,
+            &w1_blocks_ull,
+            &w3_blocks_ull,
+            &w2_blocks_ull,
+            &tokens,
+            &hidden_dim,
+            &inter_dim,
+            &w1_bpr,
+            &w1_block_bytes,
+            &w1_type,
+            &w3_bpr,
+            &w3_block_bytes,
+            &w3_type,
+            &w2_bpr,
+            &w2_block_bytes,
+            &w2_type,
+            &swiglu_limit,
+            &grid_ptr_ull)) {
+        return nullptr;
+    }
+    auto* x = reinterpret_cast<const float*>(x_ptr_ull);
+    auto* weights = reinterpret_cast<const float*>(weight_ptr_ull);
+    auto* out = reinterpret_cast<float*>(out_ptr_ull);
+    auto* w1_blocks = reinterpret_cast<const uint8_t*>(w1_blocks_ull);
+    auto* w3_blocks = reinterpret_cast<const uint8_t*>(w3_blocks_ull);
+    auto* w2_blocks = reinterpret_cast<const uint8_t*>(w2_blocks_ull);
+    auto* grid = reinterpret_cast<const int8_t*>(grid_ptr_ull);
+
+    Py_BEGIN_ALLOW_THREADS
+    apply_omp_runtime_config();
+    std::vector<float> hidden(tokens * inter_dim);
+    #pragma omp parallel for schedule(static)
+    for (long long o = 0; o < inter_dim; ++o) {
+        const uint8_t* w1_row = w1_blocks + o * w1_bpr * w1_block_bytes;
+        const uint8_t* w3_row = w3_blocks + o * w3_bpr * w3_block_bytes;
+        for (long long token_start = 0; token_start < tokens; token_start += 8) {
+            const int batch = static_cast<int>(std::min<long long>(8, tokens - token_start));
+            float gate_vals[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            float up_vals[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            const float* x_batch = x + token_start * hidden_dim;
+            if (w1_bpr == w3_bpr && w1_block_bytes == w3_block_bytes && w1_type == w3_type) {
+                gguf_quant_dot_batch4(w1_type, x_batch, hidden_dim, batch, w1_row, w1_bpr, grid, gate_vals);
+                gguf_quant_dot_batch4(w3_type, x_batch, hidden_dim, batch, w3_row, w3_bpr, grid, up_vals);
+            } else {
+                for (int i = 0; i < batch; ++i) {
+                    const float* x_row = x_batch + i * hidden_dim;
+                    gate_vals[i] = gguf_quant_dot(w1_type, x_row, w1_row, w1_bpr, grid);
+                    up_vals[i] = gguf_quant_dot(w3_type, x_row, w3_row, w3_bpr, grid);
+                }
+            }
+            for (int i = 0; i < batch; ++i) {
+                float gate = gate_vals[i];
+                float up = up_vals[i];
+                if (swiglu_limit > 0.0f) {
+                    up = std::max(-swiglu_limit, std::min(swiglu_limit, up));
+                    gate = std::min(swiglu_limit, gate);
+                }
+                float value = silu_scalar(gate) * up;
+                if (weights) value *= weights[token_start + i];
+                hidden[(token_start + i) * inter_dim + o] = value;
+            }
+        }
+    }
+    #pragma omp parallel for schedule(static)
+    for (long long o = 0; o < hidden_dim; ++o) {
+        const uint8_t* w2_row = w2_blocks + o * w2_bpr * w2_block_bytes;
+        for (long long token_start = 0; token_start < tokens; token_start += 8) {
+            const int batch = static_cast<int>(std::min<long long>(8, tokens - token_start));
+            float out_vals[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            const float* hidden_batch = hidden.data() + token_start * inter_dim;
+            gguf_quant_dot_batch4(w2_type, hidden_batch, inter_dim, batch, w2_row, w2_bpr, grid, out_vals);
+            for (int i = 0; i < batch; ++i) {
+                out[(token_start + i) * hidden_dim + o] = out_vals[i];
+            }
+        }
+    }
+    Py_END_ALLOW_THREADS
+    Py_RETURN_NONE;
+}
+
+static PyObject* gguf_quantized_matmul(PyObject*, PyObject* args) {
+    unsigned long long x_ptr_ull, blocks_ptr_ull, out_ptr_ull, grid_ptr_ull;
+    long long tokens, in_dim, rows, blocks_per_row, block_bytes, type_id;
+    if (!PyArg_ParseTuple(
+            args,
+            "KKKLLLLLLK",
+            &x_ptr_ull,
+            &blocks_ptr_ull,
+            &out_ptr_ull,
+            &tokens,
+            &in_dim,
+            &rows,
+            &blocks_per_row,
+            &block_bytes,
+            &type_id,
+            &grid_ptr_ull)) {
+        return nullptr;
+    }
+    auto* x = reinterpret_cast<const float*>(x_ptr_ull);
+    auto* blocks = reinterpret_cast<const uint8_t*>(blocks_ptr_ull);
+    auto* out = reinterpret_cast<float*>(out_ptr_ull);
+    auto* grid = reinterpret_cast<const int8_t*>(grid_ptr_ull);
+    Py_BEGIN_ALLOW_THREADS
+    apply_omp_runtime_config();
+    #pragma omp parallel for schedule(static)
+    for (long long tr = 0; tr < tokens * rows; ++tr) {
+        const long long token = tr / rows;
+        const long long row = tr - token * rows;
+        const float* x_row = x + token * in_dim;
+        const uint8_t* weight_row = blocks + row * blocks_per_row * block_bytes;
+        float value;
+        if (type_id == 0) {
+            value = gguf_iq2_xxs_dot(x_row, weight_row, blocks_per_row, grid);
+        } else {
+            value = gguf_q2_k_dot(x_row, weight_row, blocks_per_row);
+        }
+        out[token * rows + row] = value;
+    }
+    Py_END_ALLOW_THREADS
+    Py_RETURN_NONE;
+}
+
+
 static PyMethodDef Methods[] = {
     {"routed_fp4_moe_forward", routed_fp4_moe_forward, METH_VARARGS, nullptr},
     {"routed_fp4_moe_forward_raw", routed_fp4_moe_forward_raw, METH_VARARGS, nullptr},
@@ -2413,6 +3018,9 @@ static PyMethodDef Methods[] = {
     {"cpu_moe_server_loop_int8", cpu_moe_server_loop_int8, METH_VARARGS, nullptr},
     {"cpu_moe_server_loop_int8_v2", cpu_moe_server_loop_int8_v2, METH_VARARGS, nullptr},
     {"int8_expert_forward", int8_expert_forward, METH_VARARGS, nullptr},
+    {"gguf_routes_forward", gguf_routes_forward, METH_VARARGS, nullptr},
+    {"gguf_expert_forward", gguf_expert_forward, METH_VARARGS, nullptr},
+    {"gguf_quantized_matmul", gguf_quantized_matmul, METH_VARARGS, nullptr},
     {"host_float_allreduce", host_float_allreduce, METH_VARARGS, nullptr},
     {"host_float_allreduce_unlink", host_float_allreduce_unlink, METH_VARARGS, nullptr},
     {"set_omp_num_threads", set_omp_num_threads, METH_VARARGS, nullptr},
