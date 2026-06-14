@@ -733,7 +733,7 @@ torch::Tensor gguf_moe_single_token_iq2_q2k_forward(
     TORCH_CHECK(w1_blocks.size(1) == w3_blocks.size(1), "w1/w3 inter_dim mismatch");
     TORCH_CHECK(w1_blocks.size(2) == w3_blocks.size(2), "w1/w3 block count mismatch");
     TORCH_CHECK(w1_blocks.size(3) == 66 && w3_blocks.size(3) == 66, "w1/w3 must be IQ2_XXS blocks");
-    TORCH_CHECK(w2_blocks.size(3) == 84, "w2 must be Q2_K blocks");
+    TORCH_CHECK(w2_blocks.size(3) == 66 || w2_blocks.size(3) == 84, "w2 must be IQ2_XXS or Q2_K blocks");
     TORCH_CHECK(w1_blocks.size(2) * 256 >= x.size(1), "w1/w3 blocks do not cover x dim");
     TORCH_CHECK(w2_blocks.size(1) == x.size(1), "w2 output dimension mismatch");
     TORCH_CHECK(w2_blocks.size(2) * 256 >= w1_blocks.size(1), "w2 blocks do not cover inter dim");
