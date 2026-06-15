@@ -67,6 +67,11 @@ torch::Tensor prefill_sparse_attn_headpair_forward_cuda(
 
 torch::Tensor hadamard128_forward_cuda(const torch::Tensor& x);
 
+torch::Tensor fused_rms_norm_forward_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    double eps);
+
 torch::Tensor fused_c4_indexer_decode_forward_cuda(
     const torch::Tensor& q,
     const torch::Tensor& kv,
@@ -1892,6 +1897,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("prefill_sparse_attn_forward", &prefill_sparse_attn_forward, "prefill sparse attention forward (CUDA)");
     m.def("prefill_sparse_attn_headpair_forward", &prefill_sparse_attn_headpair_forward, "prefill sparse attention computing two heads per block (CUDA)");
     m.def("hadamard128_forward", &hadamard128_forward_cuda, "Hadamard128 forward (CUDA)");
+    m.def("fused_rms_norm_forward", &fused_rms_norm_forward_cuda, "fused RMSNorm forward (CUDA)");
     m.def("fused_c4_indexer_decode_forward", &fused_c4_indexer_decode_forward, "fused C4 indexer decode forward (CUDA)");
     m.def("c4_topk_from_scores", &c4_topk_from_scores, "C4 indexer top-k from scores (CUDA)");
     m.def("hc_split_pre_forward", &hc_split_pre_forward, "HC split/sinkhorn/pre-sum forward (CUDA)");

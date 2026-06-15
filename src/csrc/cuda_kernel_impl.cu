@@ -8589,3 +8589,101 @@ void fused_o_inverse_rope_inplace_cuda(
             total_rows, H, S, D, rd);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+// ============================================================================
+// Fused RMSNorm: y = x * rsqrt(mean(x^2) + eps) * weight
+// One block per token (row), block-wide reduction for variance.
+// ============================================================================
+template <typename scalar_t, int kThreads>
+__global__ void fused_rms_norm_kernel(
+        const scalar_t* __restrict__ x,    // [batch, dim] input (fp16/bf16/fp32)
+        const float* __restrict__ weight,  // [dim] fp32
+        at::Half* __restrict__ y,          // [batch, dim] output (fixed fp16)
+        const int batch,
+        const int dim,
+        const float eps) {
+    const int row = blockIdx.x;
+    if (row >= batch) return;
+    const int tid = threadIdx.x;
+
+    const scalar_t* x_row = x + row * dim;
+    at::Half* y_row = y + row * dim;
+
+    // Step 1: compute sum-of-squares (thread-local accumulate + block reduce)
+    float sum_sq = 0.0f;
+    for (int i = tid; i < dim; i += kThreads) {
+        float val = static_cast<float>(x_row[i]);
+        sum_sq += val * val;
+    }
+    // Block reduce (warp shuffle within each warp, then across warps via shared mem)
+    __shared__ float smem[kThreads / 32];  // one per warp
+    const int warp_id = tid / 32;
+    const int lane = tid % 32;
+    // Warp reduce
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
+    }
+    if (lane == 0) {
+        smem[warp_id] = sum_sq;
+    }
+    __syncthreads();
+    // Final reduction across warps (only warp 0)
+    float total_sum_sq = (tid < (kThreads / 32)) ? smem[tid] : 0.0f;
+    if (tid < 32) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            total_sum_sq += __shfl_xor_sync(0xFFFFFFFF, total_sum_sq, offset);
+        }
+    }
+    // Broadcast to all threads
+    if (tid == 0) {
+        smem[0] = total_sum_sq;
+    }
+    __syncthreads();
+    total_sum_sq = smem[0];
+
+    // Step 2: compute inv_rms = rsqrt(mean + eps) and apply normalization
+    const float mean_sq = total_sum_sq / static_cast<float>(dim);
+    const float inv_rms = rsqrtf(mean_sq + eps);
+
+    // Step 3: y = x * inv_rms * weight (fused)
+    for (int i = tid; i < dim; i += kThreads) {
+        float val = static_cast<float>(x_row[i]);
+        float normed = val * inv_rms * weight[i];
+        y_row[i] = static_cast<at::Half>(normed);
+    }
+}
+
+torch::Tensor fused_rms_norm_forward_cuda(
+        const torch::Tensor& x,
+        const torch::Tensor& weight,
+        double eps) {
+    c10::cuda::CUDAGuard device_guard(x.device());
+    TORCH_CHECK(x.dim() == 2, "fused_rms_norm: x must be 2D [batch, dim]");
+    TORCH_CHECK(weight.dim() == 1, "fused_rms_norm: weight must be 1D [dim]");
+    TORCH_CHECK(weight.scalar_type() == torch::kFloat32, "fused_rms_norm: weight must be fp32");
+
+    auto x_contig = x.contiguous();
+    auto weight_contig = weight.contiguous();
+    const int batch = static_cast<int>(x_contig.size(0));
+    const int dim = static_cast<int>(x_contig.size(1));
+    TORCH_CHECK(weight_contig.size(0) == dim, "fused_rms_norm: weight.size(0) must == dim");
+
+    // Output in fp16 (match MiniMax RMSNorm.out_dtype default)
+    auto y = torch::empty_like(x_contig, x_contig.options().dtype(torch::kHalf));
+
+    constexpr int kThreads = 256;  // support dim up to ~25K (256*100) per token
+    const dim3 grid(batch);
+    const dim3 block(kThreads);
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x_contig.scalar_type(), "fused_rms_norm_forward", [&] {
+        fused_rms_norm_kernel<scalar_t, kThreads><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            x_contig.data_ptr<scalar_t>(),
+            weight_contig.data_ptr<float>(),
+            y.data_ptr<at::Half>(),
+            batch, dim, static_cast<float>(eps));
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
+}
