@@ -48,7 +48,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "torch>=2.0,<2.7",
+    "torch>=2.0",
     "setuptools>=68",
     "ninja>=1.11",
     "pybind11>=2.10",
