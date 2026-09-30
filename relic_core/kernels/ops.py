@@ -5,7 +5,7 @@ from typing import Optional
 
 import torch
 
-from src.kernels.cuda_loader import load_cuda_kernel
+from relic_core.kernels.cuda_loader import load_cuda_kernel
 
 
 _FORCE_FALLBACK = os.getenv("DEEPSEEK_FORCE_FALLBACK", "0").lower() in {"1", "true", "yes"}

@@ -14,7 +14,7 @@ sys.path.insert(0, str(project_root))
 _TRITON_AVAILABLE = False
 _TRITON_IMPORT_ERROR = None
 try:
-    from src.kernels.int8_per_token_head_triton import qwen_int8_per_token_head_decode_triton
+    from relic_core.kernels.int8_per_token_head_triton import qwen_int8_per_token_head_decode_triton
     _TRITON_AVAILABLE = True
 except Exception as e:
     _TRITON_IMPORT_ERROR = str(e)

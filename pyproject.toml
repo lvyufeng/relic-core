@@ -1,0 +1,67 @@
+[build-system]
+# Torch is deliberately absent from this list. setup.py imports
+# torch.utils.cpp_extension at module level, and a Torch resolved fresh into an
+# isolated build environment does not necessarily match the CUDA toolkit the host
+# extensions are compiled against. Build with --no-build-isolation so the active
+# environment's Torch is the one that drives the extension build.
+requires = [
+    "setuptools>=68",
+    "wheel",
+    "pybind11>=2.10",
+    "cmake>=3.18",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "relic-core"
+version = "0.1.0.dev0"
+description = "Shared torch operator library for older accelerators (CUDA sm_75, CPU host ops)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "lvyufeng" }
+]
+keywords = [
+    "llm",
+    "inference",
+    "cuda",
+    "sm_75",
+    "turing",
+    "quantization",
+    "gguf",
+    "fp8",
+    "fp4",
+    "kernels",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0,<2.7",
+    "setuptools>=68",
+    "ninja>=1.11",
+    "pybind11>=2.10",
+    "cmake>=3.18",
+]
+
+[project.optional-dependencies]
+triton = ["triton>=2.0"]
+
+[project.urls]
+Homepage = "https://github.com/lvyufeng/relic-core"
+Repository = "https://github.com/lvyufeng/relic-core"
+Issues = "https://github.com/lvyufeng/relic-core/issues"
+
+# Packages are resolved in setup.py via find_packages() so the list cannot drift
+# from the tree the way a hand-maintained literal did.

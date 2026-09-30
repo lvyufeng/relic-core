@@ -1,0 +1,10 @@
+include README.md
+include LICENSE
+include requirements.txt
+
+# Extension sources, needed for an sdist to rebuild ext_modules.
+recursive-include relic_core/csrc *.cpp *.cu *.cuh *.h *.hpp
+recursive-include relic_core/kernels *.py
+
+# Build trees are environment-specific and are already git-ignored.
+prune build
