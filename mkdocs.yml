@@ -1,0 +1,161 @@
+# Documentation site for relic-core, published to GitHub Pages by
+# .github/workflows/pages.yml.
+#
+# `docs_dir` points at the `docs/` tree the repository already had, so publishing the
+# site moves no files: the same markdown is the GitHub directory index and the site
+# source. `docs/README.md` is the site home — MkDocs treats a README.md as the index
+# page of its directory, and if both index.md and README.md existed here the README
+# would be ignored instead.
+site_name: relic-core
+site_url: https://lvyufeng.github.io/relic-core/
+site_description: >-
+  Shared torch operator library for older accelerators: CUDA sm_75 kernels and the
+  CPU host ops an offload path runs
+site_author: lvyufeng
+copyright: MIT licensed. Third-party components keep their own licenses.
+
+repo_url: https://github.com/lvyufeng/relic-core
+repo_name: lvyufeng/relic-core
+edit_uri: edit/master/docs/
+
+docs_dir: docs
+use_directory_urls: true
+
+theme:
+  name: material
+  language: en
+  favicon: assets/favicon.svg
+  # Only overrides/main.html lives here, and it does nothing except fill
+  # `{% block announce %}`. Material's own main.html is four lines that just
+  # extend base.html, so overriding it drops no other block.
+  custom_dir: overrides
+
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+  features:
+    - announce.dismiss
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+
+extra_css:
+  - stylesheets/extra.css
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/lvyufeng/relic-core
+      name: relic-core on GitHub
+
+plugins:
+  # Material segments CJK with jieba and joins the pieces with U+200B, which its built-in
+  # separator "[\s\-]+" does not match — so a CJK term that was indexed is unreachable by
+  # its own words, and silently so. The monorepo this repository came out of carries that
+  # fix; this site keeps it even though no page here contains CJK yet. The pages that do
+  # live in RelicLLM and PocketLLM, and relocating one of them later should not quietly
+  # bring a search corpus with it that cannot be searched.
+  #
+  # The separator is the one Material ships in templates/partials/languages/zh.html,
+  # written with backslash-u escapes rather than literal characters so the zero-width
+  # space stays visible in review; Python's `re` and the worker's `new RegExp` both accept
+  # the escapes. Declaring `plugins:` at all means this list is the whole list.
+  - search:
+      lang:
+        - en
+        - zh
+      separator: '[\s\u200b\u3000\-、。，．？！；]+'
+
+nav:
+  - Home: README.md
+  - Where the boundary runs: split_boundary.md
+  - Architecture:
+      - Ternary-Bonsai-2-27B dense GEMM: architecture/ternary_bonsai_2_dense_gemm.md
+  - Guides:
+      - CUDA extension builds: guides/cuda_extension_builds.md
+      - Ascend SoC generations: guides/ascend_soc_generations.md
+  - Performance:
+      - DeepSeek-V4.1-Flash MoE weight staging: performance/deepseek_v4_1_flash_moe_weight_staging.md
+      - DeepSeek-V4.1-Flash MoE reduction: performance/deepseek_v4_1_flash_moe_reduce_csr.md
+
+# MkDocs hooks. One, and it is a build-time check rather than a feature: it warns
+# when `docs/llms.txt` is out of date with the nav above, which `--strict` turns
+# into a failure. CI runs no pytest, so the docs build is the only check that
+# runs on a documentation change, and this is where that check has to live.
+hooks:
+  - hooks/llms_txt_staleness.py
+
+# The build is the link checker: `mkdocs build --strict` runs in CI and promotes
+# every warning below to a failure. Anything omitted from `nav` also fails, so no
+# document can be reachable only by guessing its filename.
+#
+# What it cannot check is a link that leaves the repository. Those are written as
+# absolute URLs on purpose — see the note at the top of `docs/README.md`.
+validation:
+  nav:
+    omitted_files: warn
+    not_found: warn
+    absolute_links: warn
+  links:
+    not_found: warn
+    absolute_links: warn
+    unrecognized_links: warn
+    anchors: warn
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - footnotes
+  # Chinese headings appear in the monorepo's documents, so slugify has to keep
+  # non-ASCII instead of stripping it the way the Markdown default does. No page
+  # here has one today; kept for the same reason as the search locale above.
+  - toc:
+      permalink: true
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - pymdownx.betterem
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tilde
+  - pymdownx.snippets
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+watch:
+  - docs
+  - mkdocs.yml

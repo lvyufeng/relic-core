@@ -1,0 +1,25 @@
+# relic-core
+
+> Shared torch operator library for older accelerators: CUDA sm_75 kernels and the CPU host ops an offload path runs
+
+This is the index of every page the documentation site publishes. It is generated from `mkdocs.yml`
+by `scripts/gen_llms_txt.py`; edit the nav, not this file, and re-run the script.
+
+## Pages
+
+- [Home](https://lvyufeng.github.io/relic-core/)
+- [Where the boundary runs](https://lvyufeng.github.io/relic-core/split_boundary/)
+
+## Architecture
+
+- [Ternary-Bonsai-2-27B dense GEMM](https://lvyufeng.github.io/relic-core/architecture/ternary_bonsai_2_dense_gemm/)
+
+## Guides
+
+- [CUDA extension builds](https://lvyufeng.github.io/relic-core/guides/cuda_extension_builds/)
+- [Ascend SoC generations](https://lvyufeng.github.io/relic-core/guides/ascend_soc_generations/)
+
+## Performance
+
+- [DeepSeek-V4.1-Flash MoE weight staging](https://lvyufeng.github.io/relic-core/performance/deepseek_v4_1_flash_moe_weight_staging/)
+- [DeepSeek-V4.1-Flash MoE reduction](https://lvyufeng.github.io/relic-core/performance/deepseek_v4_1_flash_moe_reduce_csr/)
