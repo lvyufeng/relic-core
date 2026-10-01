@@ -9,3 +9,6 @@ dist/
 *.d
 .ninja_deps
 .ninja_log
+
+# The documentation site's build output (mkdocs.yml -> .github/workflows/pages.yml).
+/site

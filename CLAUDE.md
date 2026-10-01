@@ -18,6 +18,7 @@ a mixed-language one.
 | `relic_core/csrc/` | C++/CUDA sources, built into three extension modules |
 | `relic_core/kernels/` | Python op layer — `ops.py` dispatch, `cuda_loader.py` extension lookup |
 | `docs/split_boundary.md` | where the boundary with the model side runs, and the greps that check it |
+| `docs/` | the published site's source (`mkdocs.yml`), six pages — indexed by `docs/README.md` |
 | `tests/` | the kernel test suite and its baseline |
 
 **The boundary rule is the load-bearing invariant.** A file belongs here if it *is* an op or the
@@ -81,8 +82,15 @@ point: three tests fixed and one broken is a net improvement in a count and a re
 tree. An entry means the test *runs here and fails*; a skip belongs nowhere in it. `tests/README.md`
 has the reasoning, the skip policy and the recorder.
 
-**No CI runs the suite.** There is no workflow in this repository, so the baseline check is a manual
-step.
+**No CI runs the suite.** The only workflow here is `.github/workflows/pages.yml`, which builds the
+documentation site, so the baseline check is a manual step.
+
+That workflow runs `mkdocs build --strict`, which is the repository's link checker — but only
+*within* `docs/`. It also fails when `docs/llms.txt` is stale with the nav, because
+`hooks/llms_txt_staleness.py` checks it on every build and `--strict` promotes the warning. So a nav
+edit and the regenerated `docs/llms.txt` (`python scripts/gen_llms_txt.py`) belong in the same
+commit. Links that leave the repository are absolute URLs the build cannot see; `docs/README.md`
+says why they are written that way.
 
 ## Git workflow
 
