@@ -42,10 +42,11 @@ def _default_arch_list() -> str:
 
 
 def test_default_arch_list_covers_both_cards():
-    arches = [part.strip() for part in _default_arch_list().split(";") if part.strip()]
+    default = _default_arch_list()
+    arches = [part.strip() for part in default.split(";") if part.strip()]
     missing = [arch for arch in REQUIRED if arch not in arches]
     assert not missing, (
-        f"setup.py's default TORCH_CUDA_ARCH_LIST is {arch!r} and is missing "
+        f"setup.py's default TORCH_CUDA_ARCH_LIST is {default!r} and is missing "
         + ", ".join(f"{arch} ({REQUIRED[arch]})" for arch in missing)
         + ". A build for one of these means it cannot load on the other -- the two cards share no "
         "SASS, and these gencodes carry no PTX to JIT from."
