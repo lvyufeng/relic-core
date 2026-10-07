@@ -46,8 +46,12 @@ with **no upper bound, and adding one is a bug**: the development box runs a tor
 would pick, and a resolver that installs an older one rebuilds every kernel in the tree against the
 wrong ABI. `requirements.txt` and `pyproject.toml` must agree on this.
 
-`TORCH_CUDA_ARCH_LIST` defaults to `7.5`. **Do not drop the sm_75-specific kernel paths** — this
-library exists for that card.
+`TORCH_CUDA_ARCH_LIST` defaults to `7.5;8.9` — the Turing / RTX 2080 Ti card this library was
+written for, and Ada / RTX 4090, which runs the same sources through its own sm_89 device code.
+**Do not drop the sm_75-specific kernel paths or the `7.5` from the default** — this library exists
+for that card, and neither arch's SASS runs on the other. The two are one fatbin, no PTX, so a
+mismatch is not a slow path but a launch failure ("no kernel image is available for execution on the
+device") that only appears when a kernel is actually launched.
 
 If the environment's torch names a CUDA version with no matching toolkit on the box, point the build
 at the nearest one that exists; `torch` does not check the minor version, but `nvcc` must be on
