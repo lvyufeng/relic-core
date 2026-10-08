@@ -629,7 +629,12 @@ def soft_fp8_blockfp8_weight_dequant(
     impl: str = "auto",
 ) -> torch.Tensor:
     impl = _resolve_impl("fp8", impl)
-    if impl == "triton" and _USE_TRITON:
+    # The device, not only the capability. `_auto_impl` picks triton on an sm_8x card and the torch
+    # fallback on Turing, which is the right choice for a weight that lives on the card -- and the
+    # wrong one for a host tensor, where triton cannot take a pointer at all. A host tensor on an
+    # sm_8x machine used to reach the kernel and fail on its first argument, so the tests that build
+    # a small checkpoint on the CPU passed on sm_75 and errored on sm_89 for no reason of their own.
+    if impl == "triton" and _USE_TRITON and weight.is_cuda and scale.is_cuda:
         return soft_fp8_blockfp8_weight_dequant_triton(weight, scale, block_size)
     return soft_fp8_blockfp8_weight_dequant_torch(weight, scale, block_size)
 
@@ -965,7 +970,7 @@ def soft_fp8_blockfp8_gemm(
     impl: str = "auto",
 ) -> torch.Tensor:
     impl = _resolve_impl("fp8", impl)
-    if impl == "triton" and _USE_TRITON:
+    if impl == "triton" and _USE_TRITON and x.is_cuda and weight.is_cuda:
         return soft_fp8_blockfp8_gemm_triton(x, weight, scale)
     return soft_fp8_blockfp8_gemm_torch(x, weight, scale)
 
