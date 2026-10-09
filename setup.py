@@ -8,8 +8,18 @@ downstream runtime that already loads one of these names keeps working:
     moe_dispatch_cuda_ext  the MoE dispatch kernel
 
 Build with ``--no-build-isolation`` (see pyproject.toml).  ``TORCH_CUDA_ARCH_LIST``
-selects the arch; it defaults to ``7.5`` because Turing / RTX 2080 Ti is the
-hardware this library targets and half the kernels carry sm_75-specific paths.
+selects the arch; it defaults to ``7.5;8.9`` so that one build serves both cards
+this library has been validated on -- Turing / RTX 2080 Ti, whose sm_75-specific
+paths are half the tree, and Ada / RTX 4090.  Set it to a single arch to build for
+one of them; both are in the one fatbin a default build produces.
+
+The default carries both arches rather than only the newer one because the two
+cards cannot share a *binary*: ``sm_75`` SASS does not run on an Ada card and Ada
+SASS does not run on Turing, and these gencodes embed SASS and no PTX, so there is
+no JIT fallback to catch a mismatch -- a build for the wrong arch imports fine (the
+loader only ``exec_module``s) and dies at its first kernel launch with "no kernel
+image is available for execution on the device".  One fatbin holding both is what
+lets ``cuda_loader`` stay arch-blind and keep loading by bare name.
 """
 
 import os
@@ -25,8 +35,11 @@ ROOT = Path(__file__).resolve().parent
 EXTENSIONS_DIR = ROOT / "build" / "extensions"
 
 # Pin the arch rather than inheriting whatever the box has. A build that silently
-# targets sm_80+ produces a library that cannot load on the 2080 Ti it exists for.
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.5")
+# targets sm_80+ produces a library that cannot load on the 2080 Ti it exists for;
+# one that targets only 7.5 cannot load on a 4090. Both are in this list, and the
+# sm_75 half is not optional -- the release that dropped it would strand the card
+# half the kernel tree is written for.
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.5;8.9")
 
 
 class BuildExtensions(BuildExtension):

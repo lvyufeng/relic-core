@@ -32,7 +32,9 @@ dependency is `torch>=2.0` with no upper bound, and the box this is developed on
 than any pin would pick. Without the flag pip may reinstall a *different* torch and rebuild every
 kernel in the tree against the wrong ABI. Install it explicitly first if the environment has none.
 
-`TORCH_CUDA_ARCH_LIST` defaults to `7.5`; do not drop the sm_75-specific kernel paths.
+`TORCH_CUDA_ARCH_LIST` defaults to `7.5;8.9`, which serves both the RTX 2080 Ti this library was
+written for and the RTX 4090 that runs the same sources through sm_89 device code; do not drop the
+sm_75-specific kernel paths, and do not drop `7.5` from the default.
 
 If the environment's torch is built against a CUDA version with no matching toolkit on the box,
 point the build at the nearest one that exists rather than the one torch names — `torch` does not
