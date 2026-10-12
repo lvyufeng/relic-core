@@ -128,9 +128,24 @@ def _fp4_levels(device: torch.device) -> torch.Tensor:
 
 
 def _quantize_fp4_codes(x: torch.Tensor) -> torch.Tensor:
+    """Nearest E2M1 code per element, ties resolved to the even code.
+
+    `argmin` returns the lowest index among equal distances, so a tie lands on the lower code
+    whatever its parity. The reference rounds half to even -- the same rule `torch.round` and a
+    hardware float-to-E2M1 cast use -- which picks a different code on every tie whose lower index
+    is odd: about 0.5% of a normal-distributed activation, and always one level out of sixteen.
+
+    The two candidates in a tie are adjacent, so the correction is to step up when `argmin` landed
+    on an odd index and its neighbour is equidistant.
+    """
     levels = _fp4_levels(x.device)
     distances = (x.unsqueeze(-1) - levels).abs()
-    return distances.argmin(dim=-1).to(torch.uint8)
+    codes = distances.argmin(dim=-1)
+    upper = (codes + 1).clamp(max=levels.numel() - 1)
+    lower_d = distances.gather(-1, codes.unsqueeze(-1)).squeeze(-1)
+    upper_d = distances.gather(-1, upper.unsqueeze(-1)).squeeze(-1)
+    tied_on_odd = (lower_d == upper_d) & (codes % 2 == 1)
+    return torch.where(tied_on_odd, upper, codes).to(torch.uint8)
 
 
 def _pack_fp4_codes(codes: torch.Tensor) -> torch.Tensor:
