@@ -98,8 +98,11 @@ def _prefill_inputs(s: int = 2):
     return q.reshape(b, s, h, d), kv.reshape(b, n, d), sink, idx, (1.0 / d) ** 0.5
 
 
-def test_a_prefill_call_answers_with_the_reference_arithmetic_by_default(extension):
+def test_a_prefill_call_answers_with_the_reference_arithmetic_by_default(extension, monkeypatch):
     """The card-shaped call, with the extension present, is `_sparse_attn_torch`'s answer."""
+    # Inherited from the shell this test would take the CUDA branch the moment someone exports the
+    # knob, so ask for the default explicitly instead of assuming it.
+    monkeypatch.setattr(ops, "_PREFILL_SPARSE_ATTN_CUDA", False)
     q, kv, sink, idx, scale = _prefill_inputs()
     extension.sentinel = torch.full_like(q, 1234.0)
 
@@ -116,6 +119,9 @@ def test_a_prefill_call_answers_with_the_reference_arithmetic_by_default(extensi
 
 def test_the_env_var_still_reaches_the_kernel(extension, monkeypatch):
     """The knob stays a real switch: opted in, the same call is the extension's."""
+    # The dispatch site reads which entry point it prefers from the import-time selector, so pin it
+    # rather than inherit whatever the shell exported along with the opt-in.
+    monkeypatch.setattr(ops, "_PREFILL_SPARSE_ATTN_HEADPAIR_CUDA", True)
     monkeypatch.setattr(ops, "_PREFILL_SPARSE_ATTN_CUDA", True)
     q, kv, sink, idx, scale = _prefill_inputs()
     extension.sentinel = torch.full_like(q, 1234.0)
@@ -168,8 +174,19 @@ print(json.dumps(out))
 """
 
 
+# The env vars behind the defaults the child probe asserts on, so the shell cannot smuggle any of
+# them in: a leaked value would answer a question about this repository with one about the box.
+_ATTN_KNOBS = (
+    "DEEPSEEK_PREFILL_SPARSE_ATTN_CUDA",
+    "DEEPSEEK_PREFILL_SPARSE_ATTN_HEADPAIR_CUDA",
+    "DEEPSEEK_FUSED_DECODE_ATTN_CUDA",
+    "DEEPSEEK_TENSOR_CORE_ATTN_CUDA",
+    "DEEPSEEK_FLASHINFER_STYLE_ATTN_HEADPAIR_CUDA",
+)
+
+
 def test_the_knob_defaults_off_and_the_environment_still_overrides_it():
-    env = {k: v for k, v in os.environ.items() if k != "DEEPSEEK_PREFILL_SPARSE_ATTN_CUDA"}
+    env = {k: v for k, v in os.environ.items() if k not in _ATTN_KNOBS}
     env["PYTHONPATH"] = os.pathsep.join(
         [str(REPO_ROOT)] + [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p]
     )
