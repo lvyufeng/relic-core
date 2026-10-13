@@ -125,11 +125,13 @@ def test_the_torch_path_reproduces_the_recorded_reference_output():
     one bf16 ulp). 95% sits between them with room on both sides, so a rewrite back to the exact
     form fails here while ordinary elementwise-order noise across torch builds does not.
 
-    The value is read through `_sparse_attn_torch` rather than through `sparse_attn`, because on a
-    CUDA host with the extension loaded `sparse_attn` answers with the fused CUDA prefill kernel --
-    a *different* implementation of a different arithmetic (it does not narrow the numerator), and
-    one this recording cannot speak for. The public entry point still runs in the padding test
-    below, where the claim is an equality between two of its own answers and holds either way.
+    The value is read through `_sparse_attn_torch` rather than through `sparse_attn` so that the
+    pin is on the arithmetic and not on a host: this fixture is `d = 64`, under the 512 the fused
+    prefill branch needs, so the two names are one call here -- but only because of the shape, and
+    naming the implementation keeps that from being load-bearing. (The fused branch is opt-in now,
+    through `DEEPSEEK_PREFILL_SPARSE_ATTN_CUDA`; `test_sparse_attn_prefill_default.py` pins that.)
+    The public entry point still runs in the padding test below, where the claim is an equality
+    between two of its own answers and holds either way.
     """
     q, kv, sink, idx, scale = _fixture()
     got = ops._sparse_attn_torch(q, kv, sink, idx, scale)

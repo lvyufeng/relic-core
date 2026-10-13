@@ -19,7 +19,15 @@ _TENSOR_CORE_ATTN = os.getenv("DEEPSEEK_TENSOR_CORE_ATTN", "0").lower() in {"1",
 _TENSOR_CORE_ATTN_CUDA = os.getenv("DEEPSEEK_TENSOR_CORE_ATTN_CUDA", "0").lower() in {"1", "true", "yes"}
 _FLASHINFER_STYLE_ATTN_CUDA = os.getenv("DEEPSEEK_FLASHINFER_STYLE_ATTN_CUDA", "0").lower() in {"1", "true", "yes"}
 _FLASHINFER_STYLE_ATTN_HEADPAIR_CUDA = os.getenv("DEEPSEEK_FLASHINFER_STYLE_ATTN_HEADPAIR_CUDA", "0").lower() in {"1", "true", "yes"}
-_PREFILL_SPARSE_ATTN_CUDA = os.getenv("DEEPSEEK_PREFILL_SPARSE_ATTN_CUDA", "1").lower() in {"1", "true", "yes"}
+# Off by default, and the default is about arithmetic rather than speed. The V4.1 prefill path is
+# `_sparse_attn_torch`, the released kernel's own blocked online softmax with its bf16-narrowed
+# numerator; `prefill_sparse_attn_headpair_kernel` is a different function of the same inputs and
+# does not reproduce it. The dispatch site in `sparse_attn` says what differs. Set this to 1 to take
+# the fused kernel on a card whose extension has it -- a throughput trade, and not the arithmetic
+# the reference defines or that logits parity is measured against.
+_PREFILL_SPARSE_ATTN_CUDA = os.getenv("DEEPSEEK_PREFILL_SPARSE_ATTN_CUDA", "0").lower() in {"1", "true", "yes"}
+# Which CUDA prefill kernel the opt-in above selects, when the extension has both. It is not a
+# second chance at the reference's arithmetic: both are CUDA-side and neither narrows the numerator.
 _PREFILL_SPARSE_ATTN_HEADPAIR_CUDA = os.getenv("DEEPSEEK_PREFILL_SPARSE_ATTN_HEADPAIR_CUDA", "1").lower() in {"1", "true", "yes"}
 _SHARED_EXPERT_PAIR_INT8_CUDA = os.getenv("DEEPSEEK_SHARED_EXPERT_PAIR_INT8_CUDA", "0").lower() in {"1", "true", "yes"}
 _Q8_0_CUDA_EXT = os.getenv("DEEPSEEK_Q8_0_CUDA_EXT", "1").lower() in {"1", "true", "yes"}
@@ -1179,6 +1187,16 @@ def sparse_attn(
     softmax_scale: float,
 ) -> torch.Tensor:
     global _INT8_CUDA_EXT
+    # The reference's arithmetic, by default. `_sparse_attn_torch` is a transcription of the
+    # released `sparse_attn_kernel`: 64-wide blocks, a running max that rescales `acc_o` and
+    # `sum_exp` at every boundary, and a numerator narrowed to bf16 before P.V.
+    # `prefill_sparse_attn_headpair_kernel` is not that function -- it scores one key per warp
+    # through `__shfl_xor_sync`, keeps one global max with the sink folded into it, and narrows
+    # nothing -- and the same is true of `prefill_sparse_attn_kernel`, its non-headpair sibling.
+    # What the narrowing is worth is measured: 5.5e-3..1.0e-2 mean relative against the reference on
+    # a real `attn_sink` at head_dim 512, a fifth of a bf16 ulp, in every layer of every forward
+    # pass. So a default that picks a CUDA kernel here is a default that cannot reproduce the
+    # reference, and `DEEPSEEK_PREFILL_SPARSE_ATTN_CUDA=1` is how the kernel is asked for instead.
     if _PREFILL_SPARSE_ATTN_CUDA and q.is_cuda and q.size(1) > 1 and q.size(-1) == 512:
         if _INT8_CUDA_EXT is None:
             _INT8_CUDA_EXT = load_cuda_kernel()
