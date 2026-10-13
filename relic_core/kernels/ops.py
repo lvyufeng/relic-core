@@ -1242,19 +1242,87 @@ def sparse_attn(
     if _FUSED_DECODE_ATTN and _USE_TRITON and q.is_cuda and q.size(1) == 1 and q.size(-1) == 512 and topk_idxs.size(-1) <= 1024:
         return _fused_decode_sparse_attn_triton(q, kv, attn_sink, topk_idxs, softmax_scale)
 
+    return _sparse_attn_torch(q, kv, attn_sink, topk_idxs, softmax_scale)
+
+
+# The reference walks the top-k in blocks of this width (`block` in `sparse_attn_kernel`, the
+# released `inference/kernel.py`). It is part of the arithmetic, not a scheduling detail: the
+# numerator is narrowed to bf16 once per block, and the running max it is narrowed against only
+# moves at block boundaries, so the block width decides which bf16 values the numerator lands on.
+# Keep in step with the reference's own constant.
+_SPARSE_ATTN_BLOCK = 64
+
+
+def _sparse_attn_torch(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """The reference's sparse attention, in torch: blocked online softmax with a bf16 numerator.
+
+    This is deliberately *not* the fp32-exact softmax over the top-k, because the reference is not
+    that. `sparse_attn_kernel` keeps the running max and the sum over the numerators in fp32, but
+    narrows the numerator itself to bf16 once per block -- `T.copy(acc_s, acc_s_cast)` into a BF16
+    shared buffer, the operand of the second `T.gemm` -- and that quantization is visible in the
+    result. Measured against the reference on a real `attn_sink` at head_dim 512, an fp32-exact
+    softmax disagrees with it by 5.5e-3..1.0e-2 mean relative in the attention output; the same
+    computation with this one narrowing reproduces it to ~1e-6. The difference is not noise to be
+    tolerated downstream: it is the bf16 rounding of the numerator itself, in every layer, and it is
+    what the released weights were trained through.
+
+    The order of operations is the kernel's, and each part of it matters:
+
+    * `scores_max` starts at -1e30 rather than -inf, so a row whose every index is -1 stabilizes
+      against a finite bound and comes out all zeros instead of NaN.
+    * An invalid slot is any negative index -- `valid = topk_idxs >= 0` -- which is the reference's
+      `!= -1` sentinel test on every input a caller can reach this function with: the gate fills a
+      slot it did not select with `-1` and with no other negative value, so the two masks agree, and
+      this form is also right for a value the sentinel convention does not define, where the
+      reference's test would gather a real row from the end of the tensor.
+    * The max is a *running* max over blocks (`T.reduce_max(..., clear=False)`), and `acc_o` and
+      `sum_exp` are both rescaled by `exp(m_prev - m)` at each block boundary.
+    * The denominator sums the fp32 numerators -- `T.reduce_sum(acc_s, ...)` runs *before* the
+      copy into the bf16 buffer -- while the P.V product uses the narrowed ones. Narrowing before
+      the sum instead is a different function and does not reproduce the reference.
+    * The accumulator is fp32 throughout; only the numerator and the output are bf16.
+    * The attention sink joins the denominator after the loop, against the final running max.
+
+    No head padding here. The reference pads `h` up to 16 because its kernel's shared-memory
+    layout wants it, and the padding is a no-op: a head's score matrix is that head's `q` against
+    the window's `kv` and nothing else, so a padded head cannot move a real head's output, whatever
+    its own comes out to. The torch path computes the heads it was handed and is bitwise equal to
+    the reference's padded result on them.
+    """
     b, s, h, d = q.shape
     topk = topk_idxs.size(-1)
     safe_idxs = topk_idxs.clamp_min(0)
     batch_idx = torch.arange(b, device=q.device).view(b, 1, 1).expand_as(safe_idxs)
-    gathered = kv[batch_idx, safe_idxs]
+    gathered = kv[batch_idx, safe_idxs].to(torch.float32)
     valid = topk_idxs >= 0
+    q_f32 = q.to(torch.float32)
 
-    scores = torch.einsum("bshd,bstd->bsht", q.to(torch.float32), gathered.to(torch.float32)) * softmax_scale
-    scores = scores.masked_fill(~valid.unsqueeze(2), float("-inf"))
-    sink = attn_sink.to(torch.float32).view(1, 1, h, 1).expand(b, s, h, 1)
-    weights = torch.softmax(torch.cat([scores, sink], dim=-1), dim=-1)[..., :topk]
-    out = torch.einsum("bsht,bstd->bshd", weights, gathered.to(torch.float32))
-    return out.to(q.dtype)
+    scores_max = torch.full((b, s, h), -1e30, device=q.device, dtype=torch.float32)
+    sum_exp = torch.zeros((b, s, h), device=q.device, dtype=torch.float32)
+    acc_o = torch.zeros((b, s, h, d), device=q.device, dtype=torch.float32)
+    for start in range(0, topk, _SPARSE_ATTN_BLOCK):
+        stop = min(start + _SPARSE_ATTN_BLOCK, topk)
+        scores = torch.einsum("bshd,bsnd->bshn", q_f32, gathered[:, :, start:stop, :]) * softmax_scale
+        scores = scores.masked_fill(~valid[:, :, start:stop].unsqueeze(2), float("-inf"))
+        max_prev = scores_max
+        scores_max = torch.maximum(max_prev, scores.amax(dim=-1))
+        scores_scale = torch.exp(max_prev - scores_max)
+        numerator = torch.exp(scores - scores_max.unsqueeze(-1))
+        sum_exp = sum_exp * scores_scale + numerator.sum(dim=-1)
+        acc_o = acc_o * scores_scale.unsqueeze(-1) + torch.einsum(
+            "bshn,bsnd->bshd",
+            numerator.to(torch.bfloat16).to(torch.float32),
+            gathered[:, :, start:stop, :],
+        )
+
+    sum_exp = sum_exp + torch.exp(attn_sink.to(torch.float32).view(1, 1, h) - scores_max)
+    return (acc_o / sum_exp.unsqueeze(-1)).to(q.dtype)
 
 
 _HC_SPLIT_BLOCK_ROWS = 32
