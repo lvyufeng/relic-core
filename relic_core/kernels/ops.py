@@ -146,13 +146,14 @@ def _quantize_fp4_codes(x: torch.Tensor) -> torch.Tensor:
     upper_d = distances.gather(-1, upper.unsqueeze(-1)).squeeze(-1)
     tied_on_odd = (lower_d == upper_d) & (codes % 2 == 1)
     codes = torch.where(tied_on_odd, upper, codes).to(torch.uint8)
-    # Index 8 of the table is `+0.0` -- a *second* positive zero, because the negative half was
-    # written as a negated level list and `-0.0` has no literal that survives it -- so `argmin`
-    # could never land there and every negative input that rounded to zero came back as code 0
-    # where the reference, whose cast is sign-preserving, produced code 8. Take the magnitude from
-    # the table and the sign from the input: for a value that rounds to a nonzero code the index
-    # already carries the sign, so this moves nothing there. `x < 0` will not do, being false for
-    # `-0.0`, which is exactly the input that matters.
+    # Index 8 of the table is written `0.0` -- a *second* positive zero, where the code it stands
+    # for is `-0.0` -- so `argmin` could never land there and every negative input that rounded to
+    # zero came back as code 0 where the reference, whose cast is sign-preserving, produced code 8.
+    # Take the magnitude from the table and the sign from the input: for a value that rounds to a
+    # nonzero code the index already carries the sign, so this moves nothing there. `x < 0` will
+    # not do, being false for `-0.0`, which is exactly the input that matters. The table cannot
+    # supply this sign even if entry 8 were `-0.0`: the zeros are equidistant from a value that
+    # rounds onto zero and `argmin` takes the lower index.
     return (codes & 0x7) | (torch.signbit(x).to(torch.uint8) << 3)
 
 

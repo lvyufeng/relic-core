@@ -5,9 +5,9 @@ a quantizer emits for a value in `(-0.25, 0.0)` is invisible to arithmetic and v
 payload, and the reference picks `0x8`: its kernel ends in `T.Cast(FP4, clamp(x / s, -6, 6))`, and a
 sign-preserving cast keeps the sign of anything it rounds onto zero.
 
-The port did not, and could not: `_FP4_LEVELS` is built from a list of positive levels and their
-negations, so its index 8 is a *second* `+0.0` rather than a `-0.0`, and `argmin` never returns an
-index it is not closest to. Measured against the reference on 2.1M activations of a normal-
+The port did not, and could not: index 8 of `_FP4_LEVELS` is written `0.0`, so it is a *second*
+`+0.0` rather than a `-0.0`, and `argmin` never returns an index it is not closest to.
+Measured against the reference on 2.1M activations of a normal-
 distributed tensor, 112675 codes differed -- 5.4% -- and every one of them was code 0 against code
 8, with no value difference anywhere in the tensor. `_quantize_fp4_codes` now takes the magnitude
 from the table and the sign from the input's sign bit.
@@ -92,10 +92,8 @@ def test_the_sign_bit_is_unchanged_where_the_magnitude_carries_it(
 def test_the_zero_code_keeps_the_pairing_the_table_assumes(dtype: torch.dtype):
     """`0x0` and `0x8` are the two zeros, and neither is reachable for a nonzero magnitude.
 
-    Stated as a sweep rather than a list of cases so a future table edit that moves the zero -- or
-    drops one of the two -- fails here rather than in a payload comparison on a card.
+    Swept across the zero boundary, so the one input where the tie rule and the sign rule meet --
+    -0.25, equidistant from codes 0, 8 and 9 -- is asserted here rather than on a card.
     """
-    codes = _codes([0.0, -0.0, 0.1, -0.1, 0.24, -0.24], dtype)
-    assert set(codes) <= {0, 8}
-    assert codes[0::2] == [0, 0, 0]
-    assert codes[1::2] == [8, 8, 8]
+    codes = _codes([0.25, -0.25, 0.0, -0.0, 0.24, -0.24], dtype)
+    assert codes == [0, 8, 0, 8, 0, 8]
