@@ -128,7 +128,7 @@ def _fp4_levels(device: torch.device) -> torch.Tensor:
 
 
 def _quantize_fp4_codes(x: torch.Tensor) -> torch.Tensor:
-    """Nearest E2M1 code per element, ties resolved to the even code.
+    """Nearest E2M1 code per element, ties resolved to the even code, sign taken from the input.
 
     `argmin` returns the lowest index among equal distances, so a tie lands on the lower code
     whatever its parity. The reference rounds half to even -- the same rule `torch.round` and a
@@ -145,7 +145,15 @@ def _quantize_fp4_codes(x: torch.Tensor) -> torch.Tensor:
     lower_d = distances.gather(-1, codes.unsqueeze(-1)).squeeze(-1)
     upper_d = distances.gather(-1, upper.unsqueeze(-1)).squeeze(-1)
     tied_on_odd = (lower_d == upper_d) & (codes % 2 == 1)
-    return torch.where(tied_on_odd, upper, codes).to(torch.uint8)
+    codes = torch.where(tied_on_odd, upper, codes).to(torch.uint8)
+    # Index 8 of the table is `+0.0` -- a *second* positive zero, because the negative half was
+    # written as a negated level list and `-0.0` has no literal that survives it -- so `argmin`
+    # could never land there and every negative input that rounded to zero came back as code 0
+    # where the reference, whose cast is sign-preserving, produced code 8. Take the magnitude from
+    # the table and the sign from the input: for a value that rounds to a nonzero code the index
+    # already carries the sign, so this moves nothing there. `x < 0` will not do, being false for
+    # `-0.0`, which is exactly the input that matters.
+    return (codes & 0x7) | (torch.signbit(x).to(torch.uint8) << 3)
 
 
 def _pack_fp4_codes(codes: torch.Tensor) -> torch.Tensor:
