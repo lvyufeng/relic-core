@@ -1254,13 +1254,18 @@ def _sparse_attn_torch(
     result. Measured against the reference on a real `attn_sink` at head_dim 512, an fp32-exact
     softmax disagrees with it by 5.5e-3..1.0e-2 mean relative in the attention output; the same
     computation with this one narrowing reproduces it to ~1e-6. The difference is not noise to be
-    tolerated downstream: it is a fifth of the width of a bf16 ulp, in every layer, and it is what
-    the released weights were trained through.
+    tolerated downstream: it is the bf16 rounding of the numerator itself, in every layer, and it is
+    what the released weights were trained through.
 
     The order of operations is the kernel's, and each part of it matters:
 
     * `scores_max` starts at -1e30 rather than -inf, so a row whose every index is -1 stabilizes
       against a finite bound and comes out all zeros instead of NaN.
+    * An invalid slot is any negative index -- `valid = topk_idxs >= 0` -- which is the reference's
+      `!= -1` sentinel test on every input a caller can reach this function with: the gate fills a
+      slot it did not select with `-1` and with no other negative value, so the two masks agree, and
+      this form is also right for a value the sentinel convention does not define, where the
+      reference's test would gather a real row from the end of the tensor.
     * The max is a *running* max over blocks (`T.reduce_max(..., clear=False)`), and `acc_o` and
       `sum_exp` are both rescaled by `exp(m_prev - m)` at each block boundary.
     * The denominator sums the fp32 numerators -- `T.reduce_sum(acc_s, ...)` runs *before* the
@@ -1270,9 +1275,10 @@ def _sparse_attn_torch(
     * The attention sink joins the denominator after the loop, against the final running max.
 
     No head padding here. The reference pads `h` up to 16 because its kernel's shared-memory
-    layout wants it; the padding is a no-op there (a zero-padded head reads zero q and writes a
-    zero row), so the torch path computes the heads it was handed and is bitwise equal to the
-    reference's padded result on the real ones.
+    layout wants it, and the padding is a no-op: a head's score matrix is that head's `q` against
+    the window's `kv` and nothing else, so a padded head cannot move a real head's output, whatever
+    its own comes out to. The torch path computes the heads it was handed and is bitwise equal to
+    the reference's padded result on them.
     """
     b, s, h, d = q.shape
     topk = topk_idxs.size(-1)
