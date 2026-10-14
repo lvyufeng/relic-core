@@ -3491,6 +3491,20 @@ torch::Tensor moe_multi_token_fp4_forward_cuda(
     return y;
 }
 
+// The FP4 grouped MoE kernels below multiply with int8 tensor-core wmma -- the
+// ``wmma::fragment<..., signed char, ...>`` m16n16k16 s8 shape. Volta has no
+// int8 tensor cores and no such fragment, so under a sm_70 device pass the
+// fragment is an incomplete type and the whole module fails to compile. The
+// guard is therefore on the kernel *bodies*, not on the definitions: the host
+// launch site has to see the symbol in every pass. On sm_70 the four bodies
+// below are empty and ``moe_prefill_fp4_grouped_gemm_forward_cuda`` refuses the
+// path at run time instead of launching a kernel that computes nothing.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+#define RELIC_INT8_WMMA 1
+#else
+#define RELIC_INT8_WMMA 0
+#endif
+
 constexpr int kFp4GroupedCols = 128;
 constexpr int kFp4GroupedRows = 4;
 
@@ -3719,6 +3733,7 @@ __global__ void moe_fp4_grouped_w13_wmma_kernel(
     int rows_per_expert,
     int dim,
     int inter_dim) {
+#if RELIC_INT8_WMMA
     using namespace nvcuda;
     constexpr int TILE = 16;
     const int expert = blockIdx.z;
@@ -3822,6 +3837,7 @@ __global__ void moe_fp4_grouped_w13_wmma_kernel(
             up_f32[out] = up_acc[i] * xs;
         }
     }
+#endif
 }
 
 __global__ void moe_fp4_grouped_w2_wmma_scatter_kernel(
@@ -3835,6 +3851,7 @@ __global__ void moe_fp4_grouped_w2_wmma_scatter_kernel(
     int rows_per_expert,
     int dim,
     int inter_dim) {
+#if RELIC_INT8_WMMA
     using namespace nvcuda;
     constexpr int TILE = 16;
     const int expert = blockIdx.z;
@@ -3912,6 +3929,7 @@ __global__ void moe_fp4_grouped_w2_wmma_scatter_kernel(
             atomicAdd(y + token * dim + col, acc[i] * hidden_scale[expert * rows_per_expert + row]);
         }
     }
+#endif
 }
 
 __global__ void moe_fp4_grouped_w13_wmma64_kernel(
@@ -3927,6 +3945,7 @@ __global__ void moe_fp4_grouped_w13_wmma64_kernel(
     int rows_per_expert,
     int dim,
     int inter_dim) {
+#if RELIC_INT8_WMMA
     using namespace nvcuda;
     constexpr int TILE = 16;
     constexpr int TN = 64;
@@ -4043,6 +4062,7 @@ __global__ void moe_fp4_grouped_w13_wmma64_kernel(
             up_f32[out] = up_acc[i] * xs;
         }
     }
+#endif
 }
 
 __global__ void moe_fp4_grouped_w2_wmma64_scatter_kernel(
@@ -4056,6 +4076,7 @@ __global__ void moe_fp4_grouped_w2_wmma64_scatter_kernel(
     int rows_per_expert,
     int dim,
     int inter_dim) {
+#if RELIC_INT8_WMMA
     using namespace nvcuda;
     constexpr int TILE = 16;
     constexpr int TN = 64;
@@ -4144,6 +4165,7 @@ __global__ void moe_fp4_grouped_w2_wmma64_scatter_kernel(
             atomicAdd(y + token * dim + col, acc[i] * hidden_scale[expert * rows_per_expert + row]);
         }
     }
+#endif
 }
 
 torch::Tensor moe_prefill_fp4_grouped_gemm_forward_cuda(
@@ -4159,6 +4181,16 @@ torch::Tensor moe_prefill_fp4_grouped_gemm_forward_cuda(
     const torch::Tensor& w3s,
     double swiglu_limit) {
     c10::cuda::CUDAGuard device_guard(x.device());
+    // The grouped FP4 prefill multiplies with int8 tensor-core wmma, which is
+    // Turing (sm_75) and newer. Volta has no int8 tensor cores at all, so the
+    // four ``*_wmma*_kernel`` bodies above are compiled empty there
+    // (``RELIC_INT8_WMMA``). Say so by name rather than launch one of them.
+    {
+        const auto* fp4_prop = at::cuda::getCurrentDeviceProperties();
+        TORCH_CHECK(fp4_prop->major * 10 + fp4_prop->minor >= 75,
+                    "the FP4 grouped MoE prefill path needs int8 tensor-core wmma (sm_75+); ",
+                    "this device reports sm_", fp4_prop->major, fp4_prop->minor);
+    }
     const int routes = static_cast<int>(route_tokens.size(0));
     const int dim = static_cast<int>(x.size(1));
     const int n_experts = static_cast<int>(w1q.size(0));
@@ -9825,6 +9857,11 @@ torch::Tensor int8_gemm_pair_imma_cuda(
     cublasSetStream(handle, stream);
     const int alpha = 1;
     const int beta = 0;
+    // Bind the two scalars to `const void *` out here: nvcc 11.1's front end
+    // rejects `&alpha` on a `const` variable captured by reference, and the
+    // lambda below is the only place these addresses are needed.
+    const void* alpha_ptr = &alpha;
+    const void* beta_ptr = &beta;
 
     auto run_gemm = [&](int8_t* w_ptr, int32_t* out_ptr) {
         auto status = cublasGemmEx(
@@ -9834,14 +9871,14 @@ torch::Tensor int8_gemm_pair_imma_cuda(
             n,
             rows,
             k,
-            &alpha,
+            alpha_ptr,
             w_ptr,
             CUDA_R_8I,
             k,
             x_q.data_ptr<int8_t>(),
             CUDA_R_8I,
             k,
-            &beta,
+            beta_ptr,
             out_ptr,
             CUDA_R_32I,
             n,
