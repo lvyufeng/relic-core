@@ -8,10 +8,16 @@ downstream runtime that already loads one of these names keeps working:
     moe_dispatch_cuda_ext  the MoE dispatch kernel
 
 Build with ``--no-build-isolation`` (see pyproject.toml).  ``TORCH_CUDA_ARCH_LIST``
-selects the arch; it defaults to ``7.5;8.9`` so that one build serves both cards
-this library has been validated on -- Turing / RTX 2080 Ti, whose sm_75-specific
-paths are half the tree, and Ada / RTX 4090.  Set it to a single arch to build for
-one of them; both are in the one fatbin a default build produces.
+selects the arch; it defaults to ``7.5;8.6;8.9`` so that one build serves every card
+this library has been validated on or targets -- Turing / RTX 2080 Ti, whose
+sm_75-specific paths are half the tree; Ampere / RTX 3090; and Ada / RTX 4090.  Set
+it to a single arch to build for one of them; all three are in the one fatbin a
+default build produces.
+
+Volta / V100 is deliberately **not** in this list, and it is not an omission: CUDA
+13 removed offline compilation for Volta, so a build box with the toolkit this
+library is built against cannot emit sm_70 at all.  A V100 artifact is a second
+build from a CUDA 12.x toolkit, which is what ``docs`` in this repository record.
 
 The default carries both arches rather than only the newer one because the two
 cards cannot share a *binary*: ``sm_75`` SASS does not run on an Ada card and Ada
@@ -36,10 +42,10 @@ EXTENSIONS_DIR = ROOT / "build" / "extensions"
 
 # Pin the arch rather than inheriting whatever the box has. A build that silently
 # targets sm_80+ produces a library that cannot load on the 2080 Ti it exists for;
-# one that targets only 7.5 cannot load on a 4090. Both are in this list, and the
-# sm_75 half is not optional -- the release that dropped it would strand the card
-# half the kernel tree is written for.
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.5;8.9")
+# one that targets only 7.5 cannot load on a 3090 or a 4090. All three are in this
+# list, and the sm_75 half is not optional -- the release that dropped it would
+# strand the card half the kernel tree is written for.
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.5;8.6;8.9")
 
 
 class BuildExtensions(BuildExtension):
