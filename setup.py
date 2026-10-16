@@ -19,13 +19,13 @@ Volta / V100 is deliberately **not** in this list, and it is not an omission: CU
 library is built against cannot emit sm_70 at all.  A V100 artifact is a second
 build from a CUDA 12.x toolkit, which is what ``docs`` in this repository record.
 
-The default carries both arches rather than only the newer one because the two
-cards cannot share a *binary*: ``sm_75`` SASS does not run on an Ada card and Ada
-SASS does not run on Turing, and these gencodes embed SASS and no PTX, so there is
-no JIT fallback to catch a mismatch -- a build for the wrong arch imports fine (the
-loader only ``exec_module``s) and dies at its first kernel launch with "no kernel
-image is available for execution on the device".  One fatbin holding both is what
-lets ``cuda_loader`` stay arch-blind and keep loading by bare name.
+The default carries every arch rather than only the newest one because the cards
+cannot share a *binary*: ``sm_75`` SASS does not run on an Ampere or an Ada card,
+and neither of those runs on Turing.  These gencodes embed SASS and no PTX, so
+there is no JIT fallback to catch a mismatch -- a build for the wrong arch imports
+fine (the loader only ``exec_module``s) and dies at its first kernel launch with
+"no kernel image is available for execution on the device".  One fatbin holding all
+of them is what lets ``cuda_loader`` stay arch-blind and keep loading by bare name.
 """
 
 import os
