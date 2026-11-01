@@ -88,6 +88,8 @@ ext_modules = [
             "relic_core/csrc/mimo_decode_attention.cu",
             "relic_core/csrc/llama_mmq/gguf_mma_wrapper.cu",
             "relic_core/csrc/qwen4_exp_moe.cu",
+            "relic_core/csrc/qwen4_exp_fp8_expert.cu",
+            "relic_core/csrc/qwen4_exp_fp8_decode_moe.cu",
             "relic_core/csrc/qwen4_exp_gated_delta.cu",
             "relic_core/csrc/qwen4_exp_qsa.cu",
             "relic_core/csrc/qwen4_exp_hyper_connection.cu",
