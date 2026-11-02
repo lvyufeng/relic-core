@@ -28,7 +28,11 @@ DEFAULT_RE = re.compile(
 #: The arches the default must carry, and the card each one is for. Turing first:
 #: the sm_75 half is the one this library exists for and the one a "just bump the
 #: arch" edit drops.
-REQUIRED = {"7.5": "RTX 2080 Ti (sm_75, Turing)", "8.9": "RTX 4090 (sm_89, Ada)"}
+REQUIRED = {
+    "7.5": "RTX 2080 Ti (sm_75, Turing)",
+    "8.6": "RTX 3090 (sm_86, Ampere)",
+    "8.9": "RTX 4090 (sm_89, Ada)",
+}
 
 
 def _default_arch_list() -> str:

@@ -210,6 +210,45 @@ torch::Tensor qwen4_exp_moe_prefill_bf16_forward_cuda(
     const torch::Tensor& down,
     double swiglu_limit);
 
+// Decode-side FP8 experts: the dequantization happens inside the GEMV instead of
+// materialising a dense bf16 weight first. See qwen4_exp_fp8_expert.cu.
+torch::Tensor qwen4_exp_fp8_act_fast_cuda(const torch::Tensor& x, const torch::Tensor& expert,
+                                           const torch::Tensor& gate_up,
+                                           const torch::Tensor& gate_up_scale);
+// torch::Tensor qwen4_exp_fp8_down_planned_cuda(const torch::Tensor& act, const torch::Tensor& plan,
+                                               // const torch::Tensor& down, const torch::Tensor& down_scale,
+                                               // int64_t hidden, int64_t part, int64_t gs, int64_t gns);
+// 
+torch::Tensor qwen4_exp_fp8_slots_swiglu_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& expert,
+    const torch::Tensor& weight,
+    const torch::Tensor& gate_up,
+    const torch::Tensor& gate_up_scale,
+    const torch::Tensor& gate_up_t,
+    const torch::Tensor& down,
+    const torch::Tensor& down_scale,
+    int64_t blocks_per_expert);
+
+torch::Tensor qwen4_exp_fp8_pack_t_cuda(const torch::Tensor& weight);
+// torch::Tensor qwen4_exp_fp8_down_slots_cuda(
+    // const torch::Tensor& act,
+    // const torch::Tensor& expert,
+    // const torch::Tensor& weight,
+    // const torch::Tensor& down,
+    // const torch::Tensor& down_scale,
+    // int64_t blocks_per_expert);
+
+torch::Tensor qwen4_exp_fp8_gemv_t_bf16_cuda(
+    const torch::Tensor& packed,
+    const torch::Tensor& x);
+
+torch::Tensor qwen4_exp_fp8_linear_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& scale,
+    int64_t blocks_per_batch);
+
 std::vector<torch::Tensor> qwen4_exp_gated_delta_bf16_forward_cuda(
     const torch::Tensor& query,
     const torch::Tensor& key,
@@ -2311,6 +2350,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_multi_token_fp4_forward", &moe_multi_token_fp4_forward, "small-batch top-k MoE FP4 forward, active experts only (CUDA)");
     m.def("moe_prefill_int8_grouped_forward", &moe_prefill_int8_grouped_forward, "prefill MoE grouped int8 forward (CUDA)");
     m.def("qwen4_exp_moe_prefill_bf16_forward", &qwen4_exp_moe_prefill_bf16_forward, "Qwen4-Exp raw BF16 grouped prefill MoE forward (CUDA)");
+    m.def("qwen4_exp_fp8_act_fast", &qwen4_exp_fp8_act_fast_cuda,
+          "one top-k of experts' SwiGLU activation, 16-byte loads (x, expert ids [slots], gate/up e4m3 "
+          "[E, 2*inter, hidden], its bf16 scales)");
+    // m.def("qwen4_exp_fp8_down_planned", &qwen4_exp_fp8_down_planned_cuda,
+          // "the planned down projection (act [slots, inter], the host plan, down e4m3 [E, hidden, inter], "
+          // "its bf16 scales, hidden, K parts, blocks, row groups an expert)");
+    m.def("qwen4_exp_fp8_slots_swiglu", &qwen4_exp_fp8_slots_swiglu_cuda,
+          "Qwen4-Exp decode experts: a top-k of FP8 expert SwiGLUs in one launch pair, "
+          "dequantization fused into the GEMV, no dense bf16 weight materialised (CUDA)");
+    // m.def("qwen4_exp_fp8_down_slots", &qwen4_exp_fp8_down_slots_cuda,
+          // "Qwen4-Exp decode expert down projection: e4m3 read 16 bytes a lane, decoded by hardware, the block scale folded into the fp32 accumulate (CUDA)");
+    m.def("qwen4_exp_fp8_pack_t", &qwen4_exp_fp8_pack_t_cuda,
+          "Qwen4-Exp repack of [E, rows, cols] e4m3 into 16-byte chunk planes for the "
+          "fused decode experts and GEMV (CUDA)");
+    m.def("qwen4_exp_fp8_linear", &qwen4_exp_fp8_linear_cuda,
+          "Qwen4-Exp FP8 projection x @ W^T with the block scale fused into the load (CUDA)");
+    m.def("qwen4_exp_fp8_gemv_t_bf16", &qwen4_exp_fp8_gemv_t_bf16_cuda,
+          "Qwen4-Exp single FP8 GEMV over a packed plane, block scale fused into the load (CUDA)");
     m.def("qwen4_exp_gated_delta_bf16_forward", &qwen4_exp_gated_delta_bf16_forward, "Qwen4-Exp BF16 gated-delta recurrent scan (CUDA)");
     m.def("qwen4_exp_qsa_bf16_forward", &qwen4_exp_qsa_bf16_forward, "Qwen4-Exp indexed BF16 GQA attention (CUDA)");
     m.def("qwen4_exp_grouped_rms_norm", &qwen4_exp_grouped_rms_norm, "Qwen4-Exp grouped RMSNorm with centered gain (CUDA)");
