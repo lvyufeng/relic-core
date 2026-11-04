@@ -2813,6 +2813,9 @@ __global__ void nvfp4_gate_up_kernel(
             const uint8_t* gs = g_scl + static_cast<int64_t>(col) * hblocks;
             const uint8_t* us = u_scl + static_cast<int64_t>(col) * hblocks;
             float acc_g = 0.0f, acc_u = 0.0f;
+            // 8 bytes a lane: a warp covers 256 bytes of the row per pass. A 16-byte load was
+            // measured too -- it halves the round trips but the unpack and the doubled inner loop
+            // cost more than the stall it removes (55.2 us a route against 61.6).
             for (int base = 0; base < bytes_per_col; base += 32 * 8) {
                 const int off = base + lane * 8;
                 if (off < bytes_per_col) {
@@ -2866,21 +2869,30 @@ __global__ void nvfp4_down_kernel(
     const int col_lo = blockIdx.x * cols_per_block;
     const int col_hi = min(col_lo + cols_per_block, hidden);
     if (col_lo >= hidden) return;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const int bytes_per_col = inter / 2;
     for (int r = 0; r < topk; ++r) {
         const int local = static_cast<int>(indices[r]) - experts_start_idx;
         if (local < 0 || local >= n_local_experts) continue;
         const float w = weights[r];
         const float s2_down = w_scale2[local];
-        const uint8_t* d_row = w2q + (static_cast<int64_t>(local) * hidden) * (inter / 2);
+        const uint8_t* d_row = w2q + (static_cast<int64_t>(local) * hidden) * bytes_per_col;
         const uint8_t* d_scl = w2s + (static_cast<int64_t>(local) * hidden) * iblocks;
-        for (int col = col_lo + threadIdx.x; col < col_hi; col += blockDim.x) {
-            const uint8_t* dp = d_row + static_cast<int64_t>(col) * (inter / 2);
+        const float* row_act = act + static_cast<int64_t>(r) * inter;
+        // One warp per output column, same shape as the gate/up stage: the column is `inter/2`
+        // contiguous bytes and the lanes cover it a 256-byte window at a time.
+        for (int col = col_lo + warp; col < col_hi; col += warps) {
+            const uint8_t* dp = d_row + static_cast<int64_t>(col) * bytes_per_col;
             const uint8_t* ds = d_scl + static_cast<int64_t>(col) * iblocks;
             float acc0 = 0.0f, acc1 = 0.0f;
-            for (int b = 0; b < iblocks; ++b) {
-                const uint64_t wd = *reinterpret_cast<const uint64_t*>(dp + b * 8);
-                const float2* ap = reinterpret_cast<const float2*>(
-                    act + static_cast<int64_t>(r) * inter + b * 16);
+            for (int base = 0; base < bytes_per_col; base += 32 * 8) {
+                const int off = base + lane * 8;
+                if (off >= bytes_per_col) continue;
+                const uint64_t wd = *reinterpret_cast<const uint64_t*>(dp + off);
+                const int gb = off / 8;
+                const float2* ap = reinterpret_cast<const float2*>(row_act + gb * 16);
                 float d0 = 0.0f, d1 = 0.0f;
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
@@ -2889,11 +2901,17 @@ __global__ void nvfp4_down_kernel(
                     d0 = fmaf(nvfp4_e2m1(static_cast<uint8_t>(sd & 0xF)), av.x, d0);
                     d1 = fmaf(nvfp4_e2m1(static_cast<uint8_t>(sd >> 4)), av.y, d1);
                 }
-                const float sc = nvfp4_e4m3(ds[b]);
+                const float sc = nvfp4_e4m3(ds[gb]);
                 acc0 = fmaf(d0, sc, acc0);
                 acc1 = fmaf(d1, sc, acc1);
             }
-            atomicAdd(out + col, (acc0 + acc1) * w * s2_down);
+            float acc = acc0 + acc1;
+#pragma unroll
+            for (int d = 16; d > 0; d >>= 1) {
+                acc += __shfl_down_sync(0xFFFFFFFFu, acc, d);
+            }
+            if (lane != 0) continue;
+            atomicAdd(out + col, acc * w * s2_down);
         }
     }
 }
@@ -3017,7 +3035,13 @@ torch::Tensor nvfp4_moe_token_forward(
     // One SwiGLU row per route: the two stages are separate launches, so the intermediate has to
     // carry the route it belongs to.
     auto act = torch::empty({topk, inter}, x.options());
-    const int gate_blocks = static_cast<int>(std::min<int64_t>(68, (inter + 255) / 256));
+    // One warp a column, eight warps a block: the grid is sized by columns, not by columns/256.
+    // The previous cap gave `min(68, 3) = 3` blocks for 640 columns, i.e. 24 warps doing 130
+    // memory round trips each -- which is why a route cost 500 us to read 3.3 MB.
+    // More blocks than SMs so each SM has several warps in flight to cover memory latency; with
+    // one block on one SM the whole card waits on a single warp's round trips.
+    const int warps_per_block = 4;
+    const int gate_blocks = static_cast<int>((inter + warps_per_block - 1) / warps_per_block);
     const size_t gate_shmem = static_cast<size_t>(hidden) * sizeof(float);
     nvfp4_gate_up_kernel<<<gate_blocks, 256, gate_shmem, at::cuda::getCurrentCUDAStream()>>>(
         x.data_ptr<float>(),
@@ -3034,7 +3058,7 @@ torch::Tensor nvfp4_moe_token_forward(
         static_cast<float>(swiglu_limit),
         w_scale1.data_ptr<float>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    const int down_blocks = static_cast<int>(std::min<int64_t>(68, (hidden + 255) / 256));
+    const int down_blocks = static_cast<int>((hidden + warps_per_block - 1) / warps_per_block);
     nvfp4_down_kernel<<<down_blocks, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
         act.data_ptr<float>(),
         indices.data_ptr<int64_t>(),
