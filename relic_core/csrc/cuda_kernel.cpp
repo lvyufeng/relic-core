@@ -1691,6 +1691,36 @@ torch::Tensor moe_single_token_int8_forward(
         swiglu_limit);
 }
 
+std::vector<torch::Tensor> nvfp4_moe_token_stages(
+    const torch::Tensor& x,
+    const torch::Tensor& indices,
+    const torch::Tensor& weights,
+    const torch::Tensor& w1q, const torch::Tensor& w1s,
+    const torch::Tensor& w3q, const torch::Tensor& w3s,
+    const torch::Tensor& w2q, const torch::Tensor& w2s,
+    int64_t experts_start_idx,
+    double swiglu_limit,
+    double x_scale,
+    double down_scale,
+    const torch::Tensor& w_scale1,
+    const torch::Tensor& w_scale2,
+    bool activation_fp4);
+
+torch::Tensor nvfp4_moe_token_forward(
+    const torch::Tensor& x,
+    const torch::Tensor& indices,
+    const torch::Tensor& weights,
+    const torch::Tensor& w1q, const torch::Tensor& w1s,
+    const torch::Tensor& w3q, const torch::Tensor& w3s,
+    const torch::Tensor& w2q, const torch::Tensor& w2s,
+    int64_t experts_start_idx,
+    double swiglu_limit,
+    double x_scale,
+    double down_scale,
+    const torch::Tensor& w_scale1,
+    const torch::Tensor& w_scale2,
+    bool activation_fp4);
+
 torch::Tensor moe_single_token_fp4_forward(
     const torch::Tensor& x,
     const torch::Tensor& indices,
@@ -1716,10 +1746,10 @@ torch::Tensor moe_single_token_fp4_forward(
     TORCH_CHECK(dim % 32 == 0, "dim must be divisible by 32 for fp4 path");
     TORCH_CHECK(inter_dim % 32 == 0, "inter_dim must be divisible by 32 for fp4 path");
     TORCH_CHECK(w1q.size(2) == dim / 2 && w3q.size(2) == dim / 2, "w1/w3 packed K must equal dim/2");
-    TORCH_CHECK(w1s.size(2) == dim / 32 && w3s.size(2) == dim / 32, "w1/w3 scale K must equal dim/32");
+    TORCH_CHECK(w1s.size(2) == dim / 16 && w3s.size(2) == dim / 16, "w1/w3 scale K must equal dim/16");
     TORCH_CHECK(w2q.size(1) == dim, "w2 output dim must equal x.dim");
     TORCH_CHECK(w2q.size(2) == inter_dim / 2, "w2 packed K must equal inter_dim/2");
-    TORCH_CHECK(w2s.size(2) == inter_dim / 32, "w2 scale K must equal inter_dim/32");
+    TORCH_CHECK(w2s.size(2) == inter_dim / 16, "w2 scale K must equal inter_dim/16");
     TORCH_CHECK(w1s.size(1) == w1q.size(1) && w3s.size(1) == w3q.size(1) && w2s.size(1) == w2q.size(1), "scale row count mismatch");
     TORCH_CHECK(w1s.size(0) == w1q.size(0) && w3s.size(0) == w3q.size(0) && w2s.size(0) == w2q.size(0), "scale expert dim mismatch");
     TORCH_CHECK(x.is_cuda() && indices.is_cuda() && weights.is_cuda(), "x/indices/weights must be CUDA tensors");
@@ -1782,10 +1812,10 @@ torch::Tensor moe_multi_token_fp4_forward(
     TORCH_CHECK(dim % 32 == 0, "dim must be divisible by 32 for fp4 path");
     TORCH_CHECK(inter_dim % 32 == 0, "inter_dim must be divisible by 32 for fp4 path");
     TORCH_CHECK(w1q.size(2) == dim / 2 && w3q.size(2) == dim / 2, "w1/w3 packed K must equal dim/2");
-    TORCH_CHECK(w1s.size(2) == dim / 32 && w3s.size(2) == dim / 32, "w1/w3 scale K must equal dim/32");
+    TORCH_CHECK(w1s.size(2) == dim / 16 && w3s.size(2) == dim / 16, "w1/w3 scale K must equal dim/16");
     TORCH_CHECK(w2q.size(1) == dim, "w2 output dim must equal x.dim");
     TORCH_CHECK(w2q.size(2) == inter_dim / 2, "w2 packed K must equal inter_dim/2");
-    TORCH_CHECK(w2s.size(2) == inter_dim / 32, "w2 scale K must equal inter_dim/32");
+    TORCH_CHECK(w2s.size(2) == inter_dim / 16, "w2 scale K must equal inter_dim/16");
     TORCH_CHECK(w1s.size(1) == w1q.size(1) && w3s.size(1) == w3q.size(1) && w2s.size(1) == w2q.size(1), "scale row count mismatch");
     TORCH_CHECK(w1s.size(0) == w1q.size(0) && w3s.size(0) == w3q.size(0) && w2s.size(0) == w2q.size(0), "scale expert dim mismatch");
     TORCH_CHECK(x.is_cuda() && slot_expert.is_cuda() && slot_starts.is_cuda() && slot_tokens.is_cuda() && pair_weights.is_cuda(),
@@ -2017,10 +2047,10 @@ torch::Tensor moe_prefill_fp4_grouped_gemm_forward(
     TORCH_CHECK(dim % 32 == 0, "dim must be divisible by 32 for fp4 path");
     TORCH_CHECK(inter_dim % 32 == 0, "inter_dim must be divisible by 32 for fp4 path");
     TORCH_CHECK(w1q.size(2) == dim / 2 && w3q.size(2) == dim / 2, "w1/w3 packed K must equal dim/2");
-    TORCH_CHECK(w1s.size(2) == dim / 32 && w3s.size(2) == dim / 32, "w1/w3 scale K must equal dim/32");
+    TORCH_CHECK(w1s.size(2) == dim / 16 && w3s.size(2) == dim / 16, "w1/w3 scale K must equal dim/16");
     TORCH_CHECK(w2q.size(1) == dim, "w2 output dim must equal x.dim");
     TORCH_CHECK(w2q.size(2) == inter_dim / 2, "w2 packed K must equal inter_dim/2");
-    TORCH_CHECK(w2s.size(2) == inter_dim / 32, "w2 scale K must equal inter_dim/32");
+    TORCH_CHECK(w2s.size(2) == inter_dim / 16, "w2 scale K must equal inter_dim/16");
     TORCH_CHECK(w1s.size(0) == w1q.size(0) && w3s.size(0) == w3q.size(0) && w2s.size(0) == w2q.size(0), "scale expert dim mismatch");
     TORCH_CHECK(w1s.size(1) == w1q.size(1) && w3s.size(1) == w3q.size(1) && w2s.size(1) == w2q.size(1), "scale row count mismatch");
     TORCH_CHECK(x.is_cuda() && route_tokens.is_cuda() && route_weights_sorted.is_cuda() && seg_starts.is_cuda(), "route tensors must be CUDA tensors");
@@ -2332,6 +2362,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_single_token_int8_forward", &moe_single_token_int8_forward, "single-token top-k MoE int8 forward (CUDA)");
     m.def("moe_single_token_int8_forward_v2", &moe_single_token_int8_forward_v2, "single-token top-k MoE int8 forward with compact buffer + slot map (CUDA)");
     m.def("moe_single_token_fp4_forward", &moe_single_token_fp4_forward, "single-token top-k MoE FP4 (e2m1fn_x2 + e8m0 block) forward (CUDA)");
+    m.def(
+        "nvfp4_moe_token_stages",
+        &nvfp4_moe_token_stages,
+        "Diagnostic twin of `nvfp4_moe_token_forward`: returns (out, gate, up, swiglu) for the "
+        "first route so each stage can be diffed against its own algebra. (CUDA)");
+    m.def(
+        "nvfp4_moe_token_forward",
+        &nvfp4_moe_token_forward,
+        "ModelOpt NVFP4 top-k MoE for one token: E2M1 weights with E4M3 scales every 16 elements. "
+        "activation_fp4 selects W4A4 (the checkpoint's own regime, activation snapped to E2M1) "
+        "or W4A8 (activation kept in float, the more accurate of the two). (CUDA)",
+        pybind11::arg("x"), pybind11::arg("indices"), pybind11::arg("weights"),
+        pybind11::arg("w1q"), pybind11::arg("w1s"),
+        pybind11::arg("w3q"), pybind11::arg("w3s"),
+        pybind11::arg("w2q"), pybind11::arg("w2s"),
+        pybind11::arg("experts_start_idx") = 0,
+        pybind11::arg("swiglu_limit") = 0.0,
+        pybind11::arg("x_scale") = 1.0,
+        pybind11::arg("down_scale") = 1.0,
+        pybind11::arg("w_scale1"), pybind11::arg("w_scale2"),
+        pybind11::arg("activation_fp4") = true);
     m.def("mimo_decode_attention", &mimo_decode_attention,
           "MiMo-V2.6's decode-step attention: the span's scores, its softmax with the sink column, "
           "and the values mixed, for one row",
