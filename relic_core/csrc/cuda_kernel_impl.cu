@@ -2408,6 +2408,54 @@ __device__ __constant__ int8_t fp4_lut_x2[16] = {
     0, -1, -2, -3, -4, -6, -8, -12
 };
 
+// -- ModelOpt NVFP4 decode witnesses -------------------------------------------------------
+//
+// The two kernels below implement the semantics a ModelOpt checkpoint was built with, rather
+// than the E8M0/E2M1 pair the older FP4 path above assumes. They exist side by side because the
+// choice is measurable and neither is obviously right:
+//
+//   W4A8  -- E2M1 weights against an int8 activation. The activation keeps 8 bits, so the only
+//            error is the weight's, and it is the more accurate of the two.
+//   W4A4  -- E2M1 weights against an E2M1 activation, which is what `input_scale` calibrated.
+//            Coarser on the activation but exactly the arithmetic the checkpoint was tuned for.
+//
+// Both take one E4M3 scale a 16-element group, which is `group_size: 16` in
+// `hf_quant_config.json`. Both return a float32 row; the caller applies the two global scalars.
+
+// E4M3 byte to float. Kept separate from `fp4_block_scale` because the format there is E8M0.
+__device__ __forceinline__ float nvfp4_e4m3(uint8_t byte) {
+    const int bits = static_cast<int>(byte);
+    const int exponent = (bits >> 3) & 0xF;
+    const int mantissa = bits & 0x7;
+    const float m = static_cast<float>(mantissa);
+    const float value = exponent == 0 ? ldexpf(m / 8.0f, -6)
+                                      : ldexpf(1.0f + m / 8.0f, exponent - 7);
+    return (bits & 0x80) ? -value : value;
+}
+
+// E2M1 nibble to float, from the code set {0, .5, 1, 1.5, 2, 3, 4, 6} with a sign bit.
+__device__ __forceinline__ float nvfp4_e2m1(uint8_t nibble) {
+    const float mag = fp4_lut_x2[nibble & 0x7] * 0.5f;
+    return (nibble & 0x8) ? -mag : mag;
+}
+
+// The nearest E2M1 code to `v`, as a nibble. Saturates at +-6, the format's largest magnitude.
+__device__ __forceinline__ uint8_t nvfp4_e2m1_quantize(float v) {
+    const bool neg = v < 0.0f;
+    const float a = fabsf(v);
+    // 0, .5, 1, 1.5, 2, 3, 4, 6 -- midpoint thresholds, so this rounds to nearest.
+    uint8_t code;
+    if (a < 0.25f) code = 0;
+    else if (a < 0.75f) code = 1;
+    else if (a < 1.25f) code = 2;
+    else if (a < 1.75f) code = 3;
+    else if (a < 2.5f) code = 4;
+    else if (a < 3.5f) code = 5;
+    else if (a < 5.0f) code = 6;
+    else code = 7;
+    return neg ? static_cast<uint8_t>(code | 0x8) : code;
+}
+
 __device__ __forceinline__ void fp4_init_byte_lut(uint16_t* lut_pair, int tid, int block_threads) {
     // Each entry maps a byte (= two FP4 nibbles) to a uint16 holding the two
     // dequantized int8 values (already *2 from the e2m1 LUT) in low/high byte.
@@ -2441,9 +2489,23 @@ __device__ __forceinline__ int fp4_unpack_4codes_prmt(uint32_t two_bytes) {
     return static_cast<int>((pos & ~mask) | (neg & mask));
 }
 
+// An FP8 E4M3 byte, decoded to float: 1 sign, 4 exponent (bias 7), 3 mantissa bits. The
+// previous rule here was `2^(byte-1)`, which is not any float format -- it reads the byte 0x7E,
+// which E4M3 spells 448.0, as 2^125. A ModelOpt checkpoint stores these scales as E4M3 (the
+// safetensors dtype is F8_E4M3 and the values it holds run 24 to 448), so that rule turned every
+// product into an overflow and the kernel answered zeros.
 __device__ __forceinline__ float fp4_block_scale(uint8_t scale_byte) {
-    const int exponent = max(0, static_cast<int>(scale_byte) - 1);
-    return __int_as_float(exponent << 23);
+    const int bits = static_cast<int>(scale_byte);
+    const int sign = (bits >> 7) & 1;
+    const int exponent = (bits >> 3) & 0xF;
+    const int mantissa = bits & 0x7;
+    float value;
+    if (exponent == 0) {
+        value = ldexpf(static_cast<float>(mantissa) / 8.0f, -6);
+    } else {
+        value = ldexpf(1.0f + static_cast<float>(mantissa) / 8.0f, exponent - 7);
+    }
+    return sign ? -value : value;
 }
 
 __device__ __forceinline__ float fp4_value_from_code_scale(uint8_t code, uint8_t scale_byte) {
@@ -2531,7 +2593,11 @@ __global__ void moe_single_w1w3_fp4_kernel(
     if (route >= topk) return;
     const int local = static_cast<int>(indices[route]) - experts_start_idx;
     const int dim_packs = dim / 4;       // x_q packed as int8x4
-    const int blocks_k = dim / 32;       // one e8m0 byte per 32 K elems
+    // One UE4M3 byte per 16 K elems -- the ModelOpt NVFP4 grouping -- rather than 32. The 32
+    // grouping this kernel was written for is what `moe_single_token_fp4_forward` documents and
+    // what an earlier checkpoint shipped; a ModelOpt checkpoint states `group_size: 16` and stores
+    // it that way, so reading it at 32 reads half the scales it wrote.
+    const int blocks_k = dim / 16;
     extern __shared__ int x_shared[];
     const int* x_i32 = reinterpret_cast<const int*>(x_q);
     for (int idx = threadIdx.x; idx < dim_packs; idx += blockDim.x) {
@@ -2552,16 +2618,16 @@ __global__ void moe_single_w1w3_fp4_kernel(
     const uint16_t* w3_pack_base = reinterpret_cast<const uint16_t*>(w3_row_bytes);
     float gate_acc = 0.0f;
     float up_acc = 0.0f;
-    // Each K-block of 32 elems: 16 weight bytes = 8 uint16 (each uint16 = 4
-    // codes). 8 activation int8x4 packs (32 int8). Two __dp4a per uint16.
+    // Each K-block of 16 elems: 8 weight bytes = 4 uint16 (each uint16 = 4 codes), 4 activation
+    // int8x4 packs.
     for (int kb = 0; kb < blocks_k; ++kb) {
-        const uint16_t* w1_pack = w1_pack_base + kb * 8;
-        const uint16_t* w3_pack = w3_pack_base + kb * 8;
-        const int* x_pack = x_shared + kb * 8;
+        const uint16_t* w1_pack = w1_pack_base + kb * 4;
+        const uint16_t* w3_pack = w3_pack_base + kb * 4;
+        const int* x_pack = x_shared + kb * 4;
         int gate_block = 0;
         int up_block = 0;
         #pragma unroll
-        for (int ip = 0; ip < 8; ++ip) {
+        for (int ip = 0; ip < 4; ++ip) {
             const uint32_t w1_bits = static_cast<uint32_t>(w1_pack[ip]);
             const uint32_t w3_bits = static_cast<uint32_t>(w3_pack[ip]);
             const int w1_p = fp4_unpack_4codes_prmt(w1_bits);
@@ -2655,7 +2721,7 @@ __global__ void moe_single_w2_accum_fp4_kernel(
     const int local = static_cast<int>(indices[route]) - experts_start_idx;
     if (local < 0 || local >= n_local_experts) return;
     const int packs = inter_dim / 4;
-    const int blocks_k = inter_dim / 32;
+    const int blocks_k = inter_dim / 16;   // UE4M3 a 16 elems, the ModelOpt NVFP4 grouping
     extern __shared__ int h_shared[];
     const int* h_i32 = reinterpret_cast<const int*>(hidden_q + route * inter_dim);
     for (int idx = threadIdx.x; idx < packs; idx += blockDim.x) {
@@ -2668,11 +2734,11 @@ __global__ void moe_single_w2_accum_fp4_kernel(
     const uint16_t* w2_pack_base = reinterpret_cast<const uint16_t*>(w2_row_bytes);
     float row_acc = 0.0f;
     for (int kb = 0; kb < blocks_k; ++kb) {
-        const uint16_t* w2_pack = w2_pack_base + kb * 8;
-        const int* h_pack = h_shared + kb * 8;
+        const uint16_t* w2_pack = w2_pack_base + kb * 4;
+        const int* h_pack = h_shared + kb * 4;
         int blk = 0;
         #pragma unroll
-        for (int ip = 0; ip < 8; ++ip) {
+        for (int ip = 0; ip < 4; ++ip) {
             const uint32_t w_bits = static_cast<uint32_t>(w2_pack[ip]);
             const int w_p = fp4_unpack_4codes_prmt(w_bits);
             blk = __dp4a(h_pack[ip], w_p, blk);
@@ -2681,6 +2747,357 @@ __global__ void moe_single_w2_accum_fp4_kernel(
     }
     atomicAdd(y + col, row_acc * hidden_scale[route]);
 }
+
+// -- ModelOpt NVFP4 decode ------------------------------------------------------------------
+//
+// The kernels below implement the semantics a ModelOpt checkpoint was built with, rather than the
+// E8M0/E2M1 pair the older FP4 path assumes. Both read E4M3 scales a 16-element group, which is
+// what `hf_quant_config.json` declares as `group_size: 16`, and both take E2M1 weight codes.
+//
+// They are two kernels on purpose. The question they answer is which activation regime is worth
+// running, and that is measurable rather than obvious:
+//
+//   W4A8 (`activation_fp4 = false`) -- weights quantised to E2M1, the activation kept at the
+//       caller's precision and reduced in float. Only the weight carries quantisation error, so
+//       this is the more accurate of the two, and it costs a float multiply a weight.
+//   W4A4 (`activation_fp4 = true`) -- the activation is quantised to E2M1 as well, against the
+//       scale its own `input_scale` calibrated, then both sides are decoded. That is exactly the
+//       arithmetic the checkpoint was tuned for, and it is what an FP4 tensor core would do; here
+//       it is software, so the arithmetic saving is real but smaller than a second read of the
+//       weights would be.
+
+// One route's gate/up/SwiGLU, written out for comparison. Same arithmetic as the loop inside
+// Two launches, so both projections can use the grid.
+//
+// Gate/up for every route, SwiGLU applied, into `act[topk][inter]` -- one row a route, because a
+// route's down projection reads only its own SwiGLU output. One warp owns one column: a column is
+// `hidden/2` contiguous bytes and the warp walks it 32 lanes at a time, so the read is one
+// coalesced transaction rather than 32 scattered 8-byte ones.
+__global__ void nvfp4_gate_up_kernel(
+    const float* __restrict__ x,
+    const int64_t* __restrict__ indices,
+    const float* __restrict__ weights,
+    const uint8_t* __restrict__ w1q, const uint8_t* __restrict__ w1s,
+    const uint8_t* __restrict__ w3q, const uint8_t* __restrict__ w3s,
+    float* __restrict__ act,
+    int topk, int n_local_experts, int experts_start_idx,
+    int hidden, int inter, float swiglu_limit,
+    const float* __restrict__ w_scale1) {
+    extern __shared__ float sh[];
+    float* s_x = sh;
+    const int hblocks = hidden / 16;
+    const int cols_per_block = (inter + gridDim.x - 1) / gridDim.x;
+    const int col_lo = blockIdx.x * cols_per_block;
+    const int col_hi = min(col_lo + cols_per_block, inter);
+    if (col_lo >= inter) return;
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+        s_x[i] = x[i];
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const int bytes_per_col = hidden / 2;
+    for (int r = 0; r < topk; ++r) {
+        const int local = static_cast<int>(indices[r]) - experts_start_idx;
+        if (local < 0 || local >= n_local_experts) continue;
+        const float w = weights[r];
+        const float s2_up = w_scale1[local];
+        const uint8_t* g_row = w1q + (static_cast<int64_t>(local) * inter) * bytes_per_col;
+        const uint8_t* u_row = w3q + (static_cast<int64_t>(local) * inter) * bytes_per_col;
+        const uint8_t* g_scl = w1s + (static_cast<int64_t>(local) * inter) * hblocks;
+        const uint8_t* u_scl = w3s + (static_cast<int64_t>(local) * inter) * hblocks;
+        for (int col = col_lo + warp; col < col_hi; col += warps) {
+            const uint8_t* gp = g_row + static_cast<int64_t>(col) * bytes_per_col;
+            const uint8_t* up = u_row + static_cast<int64_t>(col) * bytes_per_col;
+            const uint8_t* gs = g_scl + static_cast<int64_t>(col) * hblocks;
+            const uint8_t* us = u_scl + static_cast<int64_t>(col) * hblocks;
+            float acc_g = 0.0f, acc_u = 0.0f;
+            for (int base = 0; base < bytes_per_col; base += 32 * 8) {
+                const int off = base + lane * 8;
+                if (off < bytes_per_col) {
+                    const uint64_t wg = *reinterpret_cast<const uint64_t*>(gp + off);
+                    const uint64_t wu = *reinterpret_cast<const uint64_t*>(up + off);
+                    const int gb = off / 8;
+                    const float2* xp = reinterpret_cast<const float2*>(s_x + gb * 16);
+                    float dg0 = 0.0f, dg1 = 0.0f, du0 = 0.0f, du1 = 0.0f;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const float2 xv = xp[j];
+                        const int sg = static_cast<int>((wg >> (j * 8)) & 0xFF);
+                        const int su = static_cast<int>((wu >> (j * 8)) & 0xFF);
+                        dg0 = fmaf(nvfp4_e2m1(static_cast<uint8_t>(sg & 0xF)), xv.x, dg0);
+                        dg1 = fmaf(nvfp4_e2m1(static_cast<uint8_t>(sg >> 4)), xv.y, dg1);
+                        du0 = fmaf(nvfp4_e2m1(static_cast<uint8_t>(su & 0xF)), xv.x, du0);
+                        du1 = fmaf(nvfp4_e2m1(static_cast<uint8_t>(su >> 4)), xv.y, du1);
+                    }
+                    acc_g += (dg0 + dg1) * nvfp4_e4m3(gs[gb]);
+                    acc_u += (du0 + du1) * nvfp4_e4m3(us[gb]);
+                }
+            }
+#pragma unroll
+            for (int d = 16; d > 0; d >>= 1) {
+                acc_g += __shfl_down_sync(0xFFFFFFFFu, acc_g, d);
+                acc_u += __shfl_down_sync(0xFFFFFFFFu, acc_u, d);
+            }
+            if (lane != 0) continue;
+            float g = acc_g * s2_up;
+            float u = acc_u * s2_up;
+            if (swiglu_limit > 0.0f) {
+                u = fminf(fmaxf(u, -swiglu_limit), swiglu_limit);
+                g = fminf(g, swiglu_limit);
+            }
+            act[static_cast<int64_t>(r) * inter + col] = (g / (1.0f + __expf(-g))) * u * w;
+        }
+    }
+}
+
+__global__ void nvfp4_down_kernel(
+    const float* __restrict__ act,
+    const int64_t* __restrict__ indices,
+    const float* __restrict__ weights,
+    const uint8_t* __restrict__ w2q, const uint8_t* __restrict__ w2s,
+    float* __restrict__ out,
+    int topk, int n_local_experts, int experts_start_idx,
+    int hidden, int inter,
+    const float* __restrict__ w_scale2) {
+    const int iblocks = inter / 16;
+    const int cols_per_block = (hidden + gridDim.x - 1) / gridDim.x;
+    const int col_lo = blockIdx.x * cols_per_block;
+    const int col_hi = min(col_lo + cols_per_block, hidden);
+    if (col_lo >= hidden) return;
+    for (int r = 0; r < topk; ++r) {
+        const int local = static_cast<int>(indices[r]) - experts_start_idx;
+        if (local < 0 || local >= n_local_experts) continue;
+        const float w = weights[r];
+        const float s2_down = w_scale2[local];
+        const uint8_t* d_row = w2q + (static_cast<int64_t>(local) * hidden) * (inter / 2);
+        const uint8_t* d_scl = w2s + (static_cast<int64_t>(local) * hidden) * iblocks;
+        for (int col = col_lo + threadIdx.x; col < col_hi; col += blockDim.x) {
+            const uint8_t* dp = d_row + static_cast<int64_t>(col) * (inter / 2);
+            const uint8_t* ds = d_scl + static_cast<int64_t>(col) * iblocks;
+            float acc0 = 0.0f, acc1 = 0.0f;
+            for (int b = 0; b < iblocks; ++b) {
+                const uint64_t wd = *reinterpret_cast<const uint64_t*>(dp + b * 8);
+                const float2* ap = reinterpret_cast<const float2*>(
+                    act + static_cast<int64_t>(r) * inter + b * 16);
+                float d0 = 0.0f, d1 = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float2 av = ap[j];
+                    const int sd = static_cast<int>((wd >> (j * 8)) & 0xFF);
+                    d0 = fmaf(nvfp4_e2m1(static_cast<uint8_t>(sd & 0xF)), av.x, d0);
+                    d1 = fmaf(nvfp4_e2m1(static_cast<uint8_t>(sd >> 4)), av.y, d1);
+                }
+                const float sc = nvfp4_e4m3(ds[b]);
+                acc0 = fmaf(d0, sc, acc0);
+                acc1 = fmaf(d1, sc, acc1);
+            }
+            atomicAdd(out + col, (acc0 + acc1) * w * s2_down);
+        }
+    }
+}
+
+// The same two stages with the intermediates kept, so a caller can diff each one against its own
+// algebra. Diagnostic only; `nvfp4_moe_token_forward` is what the runtime calls.
+__global__ void nvfp4_moe_stage_kernel(
+    const float* __restrict__ x,
+    const int64_t* __restrict__ indices,
+    const uint8_t* __restrict__ w1q, const uint8_t* __restrict__ w1s,
+    const uint8_t* __restrict__ w3q, const uint8_t* __restrict__ w3s,
+    const uint8_t* __restrict__ w2q, const uint8_t* __restrict__ w2s,
+    float* __restrict__ gate_out, float* __restrict__ up_out, float* __restrict__ act_out,
+    int n_local_experts, int experts_start_idx,
+    int hidden, int inter, int a4, float swiglu_limit,
+    float x_scale, float down_scale, const float* __restrict__ w_scale1) {
+    extern __shared__ float sh[];
+    float* s_x = sh;
+    const int hblocks = hidden / 16;
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+        float v = x[i];
+        if (a4) {
+            v = nvfp4_e2m1(nvfp4_e2m1_quantize(v / x_scale)) * x_scale;
+        }
+        s_x[i] = v;
+    }
+    __syncthreads();
+    const int local = static_cast<int>(indices[0]) - experts_start_idx;
+    if (local < 0 || local >= n_local_experts) return;
+    const uint8_t* g_row = w1q + (static_cast<int64_t>(local) * inter) * (hidden / 2);
+    const uint8_t* u_row = w3q + (static_cast<int64_t>(local) * inter) * (hidden / 2);
+    const uint8_t* g_scl = w1s + (static_cast<int64_t>(local) * inter) * hblocks;
+    const uint8_t* u_scl = w3s + (static_cast<int64_t>(local) * inter) * hblocks;
+    for (int col = threadIdx.x; col < inter; col += blockDim.x) {
+        const uint8_t* gp = g_row + static_cast<int64_t>(col) * (hidden / 2);
+        const uint8_t* up = u_row + static_cast<int64_t>(col) * (hidden / 2);
+        const uint8_t* gs = g_scl + static_cast<int64_t>(col) * hblocks;
+        const uint8_t* us = u_scl + static_cast<int64_t>(col) * hblocks;
+        float acc_g = 0.0f, acc_u = 0.0f;
+        for (int b = 0; b < hblocks; ++b) {
+            const uint64_t wg = *reinterpret_cast<const uint64_t*>(gp + b * 8);
+            const uint64_t wu = *reinterpret_cast<const uint64_t*>(up + b * 8);
+            const float2* xp = reinterpret_cast<const float2*>(s_x + b * 16);
+            float dg0 = 0.0f, dg1 = 0.0f, du0 = 0.0f, du1 = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float2 xv = xp[j];
+                const int sg = static_cast<int>((wg >> (j * 8)) & 0xFF);
+                const int su = static_cast<int>((wu >> (j * 8)) & 0xFF);
+                dg0 = fmaf(nvfp4_e2m1(static_cast<uint8_t>(sg & 0xF)), xv.x, dg0);
+                dg1 = fmaf(nvfp4_e2m1(static_cast<uint8_t>(sg >> 4)), xv.y, dg1);
+                du0 = fmaf(nvfp4_e2m1(static_cast<uint8_t>(su & 0xF)), xv.x, du0);
+                du1 = fmaf(nvfp4_e2m1(static_cast<uint8_t>(su >> 4)), xv.y, du1);
+            }
+            acc_g += (dg0 + dg1) * nvfp4_e4m3(gs[b]);
+            acc_u += (du0 + du1) * nvfp4_e4m3(us[b]);
+        }
+        acc_g *= w_scale1[local];
+        acc_u *= w_scale1[local];
+        gate_out[col] = acc_g;
+        up_out[col] = acc_u;
+    }
+    __syncthreads();
+    for (int col = threadIdx.x; col < inter; col += blockDim.x) {
+        float g = gate_out[col];
+        float u = up_out[col];
+        if (swiglu_limit > 0.0f) {
+            u = fminf(fmaxf(u, -swiglu_limit), swiglu_limit);
+            g = fminf(g, swiglu_limit);
+        }
+        float act = (g / (1.0f + __expf(-g))) * u;
+        if (a4) {
+            act = nvfp4_e2m1(nvfp4_e2m1_quantize(act / down_scale)) * down_scale;
+        }
+        act_out[col] = act;
+    }
+}
+
+torch::Tensor nvfp4_moe_token_forward(
+    const torch::Tensor& x,
+    const torch::Tensor& indices,
+    const torch::Tensor& weights,
+    const torch::Tensor& w1q, const torch::Tensor& w1s,
+    const torch::Tensor& w3q, const torch::Tensor& w3s,
+    const torch::Tensor& w2q, const torch::Tensor& w2s,
+    int64_t experts_start_idx,
+    double swiglu_limit,
+    double x_scale,
+    double down_scale,
+    const torch::Tensor& w_scale1,
+    const torch::Tensor& w_scale2,
+    bool activation_fp4) {
+    TORCH_CHECK(x.dim() == 2 && x.size(0) == 1, "x must be [1, hidden]");
+    TORCH_CHECK(w_scale1.numel() == w1q.size(0) && w_scale2.numel() == w2q.size(0),
+                "weight_scale_2 must hold one value per expert");
+    TORCH_CHECK(indices.dim() == 1 && weights.dim() == 1, "indices/weights must be [k]");
+    TORCH_CHECK(indices.size(0) == weights.size(0), "indices/weights length mismatch");
+    TORCH_CHECK(w1q.dim() == 3 && w2q.dim() == 3 && w3q.dim() == 3,
+                "weights must be [E, out, in/2]");
+    const int64_t hidden = w1q.size(2) * 2;
+    const int64_t inter = w1q.size(1);
+    TORCH_CHECK(hidden % 16 == 0 && inter % 16 == 0, "hidden and inter must be multiples of 16");
+    TORCH_CHECK(w1s.size(2) == hidden / 16 && w3s.size(2) == hidden / 16,
+                "w1/w3 scales must be [E, inter, hidden/16] for group_size 16");
+    TORCH_CHECK(w2s.size(1) == hidden && w2s.size(2) == inter / 16,
+                "w2 scales must be [E, hidden, inter/16] for group_size 16");
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous(), "x must be a contiguous CUDA tensor");
+    TORCH_CHECK(indices.is_cuda() && indices.is_contiguous(), "indices must be a contiguous CUDA tensor");
+    TORCH_CHECK(weights.is_cuda() && weights.is_contiguous(), "weights must be a contiguous CUDA tensor");
+    TORCH_CHECK(w1q.is_cuda() && w1q.is_contiguous(), "w1q must be a contiguous CUDA tensor");
+    TORCH_CHECK(w1s.is_cuda() && w1s.is_contiguous(), "w1s must be a contiguous CUDA tensor");
+    TORCH_CHECK(w3q.is_cuda() && w3q.is_contiguous(), "w3q must be a contiguous CUDA tensor");
+    TORCH_CHECK(w3s.is_cuda() && w3s.is_contiguous(), "w3s must be a contiguous CUDA tensor");
+    TORCH_CHECK(w2q.is_cuda() && w2q.is_contiguous(), "w2q must be a contiguous CUDA tensor");
+    TORCH_CHECK(w2s.is_cuda() && w2s.is_contiguous(), "w2s must be a contiguous CUDA tensor");
+
+    auto out = torch::zeros({1, hidden}, x.options());
+    const int topk = static_cast<int>(indices.size(0));
+    // Two launches so both projections can use the grid. The gate/up stage writes a full-width
+    // `act`, which is what lets the down stage be split by column at all.
+    // One SwiGLU row per route: the two stages are separate launches, so the intermediate has to
+    // carry the route it belongs to.
+    auto act = torch::empty({topk, inter}, x.options());
+    const int gate_blocks = static_cast<int>(std::min<int64_t>(68, (inter + 255) / 256));
+    const size_t gate_shmem = static_cast<size_t>(hidden) * sizeof(float);
+    nvfp4_gate_up_kernel<<<gate_blocks, 256, gate_shmem, at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(),
+        indices.data_ptr<int64_t>(),
+        weights.data_ptr<float>(),
+        w1q.data_ptr<uint8_t>(), w1s.data_ptr<uint8_t>(),
+        w3q.data_ptr<uint8_t>(), w3s.data_ptr<uint8_t>(),
+        act.data_ptr<float>(),
+        topk,
+        static_cast<int>(w1q.size(0)),
+        static_cast<int>(experts_start_idx),
+        static_cast<int>(hidden),
+        static_cast<int>(inter),
+        static_cast<float>(swiglu_limit),
+        w_scale1.data_ptr<float>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    const int down_blocks = static_cast<int>(std::min<int64_t>(68, (hidden + 255) / 256));
+    nvfp4_down_kernel<<<down_blocks, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        act.data_ptr<float>(),
+        indices.data_ptr<int64_t>(),
+        weights.data_ptr<float>(),
+        w2q.data_ptr<uint8_t>(), w2s.data_ptr<uint8_t>(),
+        out.data_ptr<float>(),
+        topk,
+        static_cast<int>(w1q.size(0)),
+        static_cast<int>(experts_start_idx),
+        static_cast<int>(hidden),
+        static_cast<int>(inter),
+        w_scale2.data_ptr<float>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+// Same kernel, keeping the intermediates. Returns `(out, gate, up, act, x_used)` for the first
+// route so a caller can diff each stage against its own algebra; the decode is identical otherwise.
+std::vector<torch::Tensor> nvfp4_moe_token_stages(
+    const torch::Tensor& x,
+    const torch::Tensor& indices,
+    const torch::Tensor& weights,
+    const torch::Tensor& w1q, const torch::Tensor& w1s,
+    const torch::Tensor& w3q, const torch::Tensor& w3s,
+    const torch::Tensor& w2q, const torch::Tensor& w2s,
+    int64_t experts_start_idx,
+    double swiglu_limit,
+    double x_scale,
+    double down_scale,
+    const torch::Tensor& w_scale1,
+    const torch::Tensor& w_scale2,
+    bool activation_fp4) {
+    auto out = nvfp4_moe_token_forward(
+        x, indices, weights, w1q, w1s, w3q, w3s, w2q, w2s,
+        experts_start_idx, swiglu_limit, x_scale, down_scale,
+        w_scale1, w_scale2, activation_fp4);
+    // The stage tensors are recomputed here rather than threaded through the kernel: this is a
+    // diagnostic entry point, and keeping the hot kernel free of it is worth the second pass.
+    const int64_t hidden = w1q.size(2) * 2;
+    const int64_t inter = w1q.size(1);
+    auto gate = torch::zeros({inter}, x.options());
+    auto up = torch::zeros({inter}, x.options());
+    auto act = torch::zeros({inter}, x.options());
+    const size_t stage_shmem = static_cast<size_t>(hidden) * sizeof(float);
+    nvfp4_moe_stage_kernel<<<1, 256, stage_shmem, at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(),
+        indices.data_ptr<int64_t>(),
+        w1q.data_ptr<uint8_t>(), w1s.data_ptr<uint8_t>(),
+        w3q.data_ptr<uint8_t>(), w3s.data_ptr<uint8_t>(),
+        w2q.data_ptr<uint8_t>(), w2s.data_ptr<uint8_t>(),
+        gate.data_ptr<float>(), up.data_ptr<float>(), act.data_ptr<float>(),
+        static_cast<int>(w1q.size(0)),
+        static_cast<int>(experts_start_idx),
+        static_cast<int>(hidden), static_cast<int>(inter),
+        activation_fp4 ? 1 : 0,
+        static_cast<float>(swiglu_limit),
+        static_cast<float>(x_scale),
+        static_cast<float>(down_scale),
+        w_scale1.data_ptr<float>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {out, gate, up, act};
+}
+
 
 // Deterministic twin of the kernel above: writes each route's contribution to
 // its own row instead of accumulating them atomically.
@@ -2713,7 +3130,7 @@ __global__ void moe_single_w2_partial_fp4_kernel(
     // with, so the reducer can sum every row unconditionally.
     if (local < 0 || local >= n_local_experts) return;
     const int packs = inter_dim / 4;
-    const int blocks_k = inter_dim / 32;
+    const int blocks_k = inter_dim / 16;   // UE4M3 a 16 elems, the ModelOpt NVFP4 grouping
     extern __shared__ int h_shared[];
     const int* h_i32 = reinterpret_cast<const int*>(hidden_q + route * inter_dim);
     for (int idx = threadIdx.x; idx < packs; idx += blockDim.x) {
@@ -2726,11 +3143,11 @@ __global__ void moe_single_w2_partial_fp4_kernel(
     const uint16_t* w2_pack_base = reinterpret_cast<const uint16_t*>(w2_row_bytes);
     float row_acc = 0.0f;
     for (int kb = 0; kb < blocks_k; ++kb) {
-        const uint16_t* w2_pack = w2_pack_base + kb * 8;
-        const int* h_pack = h_shared + kb * 8;
+        const uint16_t* w2_pack = w2_pack_base + kb * 4;
+        const int* h_pack = h_shared + kb * 4;
         int blk = 0;
         #pragma unroll
-        for (int ip = 0; ip < 8; ++ip) {
+        for (int ip = 0; ip < 4; ++ip) {
             const uint32_t w_bits = static_cast<uint32_t>(w2_pack[ip]);
             const int w_p = fp4_unpack_4codes_prmt(w_bits);
             blk = __dp4a(h_pack[ip], w_p, blk);
