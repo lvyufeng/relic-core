@@ -259,6 +259,31 @@ std::vector<torch::Tensor> qwen4_exp_gated_delta_bf16_forward_cuda(
     double norm_eps,
     int64_t groups_per_block);
 
+void qwen4_exp_gather_rows_bf16_cuda(
+    const void* src_host,
+    const torch::Tensor& index,
+    torch::Tensor& out);
+
+void qwen4_exp_hc_up_mix_cuda(
+    const torch::Tensor& down,
+    const torch::Tensor& mix_up,
+    const torch::Tensor& normed,
+    torch::Tensor& out,
+    int64_t hc);
+
+void qwen4_exp_gather_runs_bf16_cuda(
+    const void* src_host,
+    const torch::Tensor& run_start,
+    const torch::Tensor& run_rows,
+    const torch::Tensor& run_dst,
+    const torch::Tensor& run_count,
+    torch::Tensor& out);
+
+void qwen4_exp_scatter_rows_bf16_cuda(
+    const torch::Tensor& src,
+    void* dst_host,
+    const torch::Tensor& at);
+
 torch::Tensor qwen4_exp_qsa_bf16_forward_cuda(
     const torch::Tensor& query,
     const torch::Tensor& key,
@@ -354,6 +379,79 @@ torch::Tensor qwen4_exp_hc_silu(const torch::Tensor& input, int64_t groups) {
 torch::Tensor qwen4_exp_hc_inject_gate(const torch::Tensor& input, int64_t groups) {
     check_qwen4_exp_hc_activation(input, groups);
     return qwen4_exp_hc_inject_gate_bf16_cuda(input, groups);
+}
+
+torch::Tensor qwen4_exp_scatter_rows_bf16(
+    const torch::Tensor& src,
+    int64_t dst_address,
+    const torch::Tensor& at) {
+    TORCH_CHECK(src.is_cuda(), "src must be a CUDA tensor");
+    TORCH_CHECK(at.is_cuda(), "at must be a CUDA tensor");
+    TORCH_CHECK(at.scalar_type() == torch::kInt32, "at must be int32");
+    TORCH_CHECK(at.is_contiguous(), "at must be contiguous");
+    TORCH_CHECK(src.is_contiguous(), "src must be contiguous");
+    TORCH_CHECK(dst_address != 0, "the host arena address must be non-null");
+    qwen4_exp_scatter_rows_bf16_cuda(
+        src, reinterpret_cast<void*>(dst_address), at);
+    return src;
+}
+
+torch::Tensor qwen4_exp_gather_runs_bf16(
+    int64_t src_address,
+    const torch::Tensor& run_start,
+    const torch::Tensor& run_rows,
+    const torch::Tensor& run_dst,
+    const torch::Tensor& run_count,
+    int64_t rows) {
+    TORCH_CHECK(run_start.is_cuda() && run_rows.is_cuda() && run_dst.is_cuda(),
+                "run tables must be CUDA tensors");
+    TORCH_CHECK(run_start.scalar_type() == torch::kInt32 && run_rows.scalar_type() == torch::kInt32 &&
+                    run_dst.scalar_type() == torch::kInt32,
+                "run tables must be int32");
+    auto out = torch::empty(
+        {rows, 256},
+        torch::TensorOptions().dtype(torch::kBFloat16).device(run_start.device()));
+    qwen4_exp_gather_runs_bf16_cuda(
+        reinterpret_cast<const void*>(src_address), run_start, run_rows, run_dst, run_count, out);
+    return out;
+}
+
+torch::Tensor qwen4_exp_hc_up_mix(
+    const torch::Tensor& down,
+    const torch::Tensor& mix_up,
+    const torch::Tensor& normed,
+    int64_t hc,
+    int64_t hidden) {
+    TORCH_CHECK(down.is_cuda() && mix_up.is_cuda() && normed.is_cuda(), "operands must be CUDA");
+    TORCH_CHECK(down.is_contiguous() && mix_up.is_contiguous() && normed.is_contiguous(),
+                "operands must be contiguous");
+    TORCH_CHECK(down.scalar_type() == torch::kBFloat16 && mix_up.scalar_type() == torch::kBFloat16 &&
+                    normed.scalar_type() == torch::kBFloat16,
+                "operands must be bfloat16");
+    TORCH_CHECK(hc > 0 && hidden > 0, "hc and hidden must be positive");
+    TORCH_CHECK(normed.size(-1) == hc * hidden, "normed must be [rows, hc * hidden]");
+    TORCH_CHECK(mix_up.size(0) == hc * hidden, "mix_up must be [hc * hidden, inter]");
+    auto out = torch::empty(
+        {down.size(0), hidden},
+        torch::TensorOptions().dtype(torch::kBFloat16).device(down.device()));
+    qwen4_exp_hc_up_mix_cuda(down, mix_up, normed, out, hc);
+    return out;
+}
+
+torch::Tensor qwen4_exp_gather_rows_bf16(
+    int64_t src_address,
+    const torch::Tensor& index) {
+    TORCH_CHECK(index.is_cuda(), "index must be a CUDA tensor");
+    TORCH_CHECK(index.scalar_type() == torch::kInt32, "index must be int32");
+    TORCH_CHECK(index.is_contiguous(), "index must be contiguous");
+    TORCH_CHECK(index.dim() == 1, "index must be one-dimensional");
+    TORCH_CHECK(src_address != 0, "the host arena address must be non-null");
+    auto out = torch::empty(
+        {index.numel(), 256},
+        torch::TensorOptions().dtype(torch::kBFloat16).device(index.device()));
+    qwen4_exp_gather_rows_bf16_cuda(
+        reinterpret_cast<const void*>(src_address), index, out);
+    return out;
 }
 
 torch::Tensor qwen4_exp_qsa_bf16_forward(
@@ -2421,6 +2519,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Qwen4-Exp single FP8 GEMV over a packed plane, block scale fused into the load (CUDA)");
     m.def("qwen4_exp_gated_delta_bf16_forward", &qwen4_exp_gated_delta_bf16_forward, "Qwen4-Exp BF16 gated-delta recurrent scan (CUDA)");
     m.def("qwen4_exp_qsa_bf16_forward", &qwen4_exp_qsa_bf16_forward, "Qwen4-Exp indexed BF16 GQA attention (CUDA)");
+    m.def("qwen4_exp_hc_up_mix", &qwen4_exp_hc_up_mix,
+          "Hyper-connection mixer: up projection, sigmoid gate and stream fold in one kernel (CUDA)");
+    m.def("qwen4_exp_gather_runs_bf16", &qwen4_exp_gather_runs_bf16,
+          "Gather whole runs of a host-resident arena into the device (zero-copy, CUDA)");
+    m.def("qwen4_exp_scatter_rows_bf16", &qwen4_exp_scatter_rows_bf16,
+          "Write 256-wide rows of a device tensor into a host-resident arena (zero-copy, CUDA)");
+    m.def("qwen4_exp_gather_rows_bf16", &qwen4_exp_gather_rows_bf16,
+          "Gather 256-wide rows of a host-resident arena into the device (zero-copy, CUDA)");
     m.def("qwen4_exp_grouped_rms_norm", &qwen4_exp_grouped_rms_norm, "Qwen4-Exp grouped RMSNorm with centered gain (CUDA)");
     m.def("qwen4_exp_inject", &qwen4_exp_inject, "Qwen4-Exp hyper-connection stream injection (CUDA)");
     m.def("xing4_hyper_connection_forward", &xing4_hyper_connection_forward_cuda,
