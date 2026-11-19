@@ -2782,7 +2782,7 @@ __global__ void nvfp4_gate_up_kernel(
     float* __restrict__ act,
     int topk, int n_local_experts, int experts_start_idx,
     int hidden, int inter, float swiglu_limit,
-    const float* __restrict__ w_scale1) {
+    const float* __restrict__ w_scale1, int rows) {
     extern __shared__ float sh[];
     float* s_x = sh;
     const int hblocks = hidden / 16;
@@ -2790,18 +2790,26 @@ __global__ void nvfp4_gate_up_kernel(
     const int col_lo = blockIdx.x * cols_per_block;
     const int col_hi = min(col_lo + cols_per_block, inter);
     if (col_lo >= inter) return;
+    // One row per block in z, so a K-row call is the same kernel with a bigger grid rather than a
+    // loop inside it. Each block loads its own row into shared memory, so no row sees another's x.
+    const int row = blockIdx.z;
+    if (row >= rows) return;
+    const float* x_row = x + static_cast<int64_t>(row) * hidden;
     for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
-        s_x[i] = x[i];
+        s_x[i] = x_row[i];
     }
     __syncthreads();
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int warps = blockDim.x >> 5;
     const int bytes_per_col = hidden / 2;
+    const int64_t* idx_row = indices + static_cast<int64_t>(row) * topk;
+    const float* wt_row = weights + static_cast<int64_t>(row) * topk;
+    float* act_row = act + static_cast<int64_t>(row) * topk * inter;
     for (int r = 0; r < topk; ++r) {
-        const int local = static_cast<int>(indices[r]) - experts_start_idx;
+        const int local = static_cast<int>(idx_row[r]) - experts_start_idx;
         if (local < 0 || local >= n_local_experts) continue;
-        const float w = weights[r];
+        const float w = wt_row[r];
         const float s2_up = w_scale1[local];
         const uint8_t* g_row = w1q + (static_cast<int64_t>(local) * inter) * bytes_per_col;
         const uint8_t* u_row = w3q + (static_cast<int64_t>(local) * inter) * bytes_per_col;
@@ -2850,7 +2858,12 @@ __global__ void nvfp4_gate_up_kernel(
                 u = fminf(fmaxf(u, -swiglu_limit), swiglu_limit);
                 g = fminf(g, swiglu_limit);
             }
-            act[static_cast<int64_t>(r) * inter + col] = (g / (1.0f + __expf(-g))) * u * w;
+            // No route weight here: `nvfp4_down_kernel` applies `weights[r]` to the accumulated
+            // row already, so multiplying here squares it and every route comes back scaled by its
+            // own probability. The FP8 slot path records the same hazard -- "the kernel's down
+            // phase already multiplies each slot by wts ... applying it again squares the routing
+            // weight and the answer diverges from the first token on" -- and this stage had it.
+            act_row[static_cast<int64_t>(r) * inter + col] = (g / (1.0f + __expf(-g))) * u;
         }
     }
 }
@@ -2863,24 +2876,30 @@ __global__ void nvfp4_down_kernel(
     float* __restrict__ out,
     int topk, int n_local_experts, int experts_start_idx,
     int hidden, int inter,
-    const float* __restrict__ w_scale2) {
+    const float* __restrict__ w_scale2, int rows) {
     const int iblocks = inter / 16;
     const int cols_per_block = (hidden + gridDim.x - 1) / gridDim.x;
     const int col_lo = blockIdx.x * cols_per_block;
     const int col_hi = min(col_lo + cols_per_block, hidden);
     if (col_lo >= hidden) return;
+    const int row = blockIdx.z;
+    if (row >= rows) return;
+    float* out_row = out + static_cast<int64_t>(row) * hidden;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int warps = blockDim.x >> 5;
     const int bytes_per_col = inter / 2;
+    const int64_t* idx_row = indices + static_cast<int64_t>(row) * topk;
+    const float* wt_row = weights + static_cast<int64_t>(row) * topk;
+    const float* act_row = act + static_cast<int64_t>(row) * topk * inter;
     for (int r = 0; r < topk; ++r) {
-        const int local = static_cast<int>(indices[r]) - experts_start_idx;
+        const int local = static_cast<int>(idx_row[r]) - experts_start_idx;
         if (local < 0 || local >= n_local_experts) continue;
-        const float w = weights[r];
+        const float w = wt_row[r];
         const float s2_down = w_scale2[local];
         const uint8_t* d_row = w2q + (static_cast<int64_t>(local) * hidden) * bytes_per_col;
         const uint8_t* d_scl = w2s + (static_cast<int64_t>(local) * hidden) * iblocks;
-        const float* row_act = act + static_cast<int64_t>(r) * inter;
+        const float* row_act = act_row + static_cast<int64_t>(r) * inter;
         // One warp per output column, same shape as the gate/up stage: the column is `inter/2`
         // contiguous bytes and the lanes cover it a 256-byte window at a time.
         for (int col = col_lo + warp; col < col_hi; col += warps) {
@@ -2911,7 +2930,7 @@ __global__ void nvfp4_down_kernel(
                 acc += __shfl_down_sync(0xFFFFFFFFu, acc, d);
             }
             if (lane != 0) continue;
-            atomicAdd(out + col, acc * w * s2_down);
+            atomicAdd(out_row + col, acc * w * s2_down);
         }
     }
 }
@@ -2990,7 +3009,7 @@ __global__ void nvfp4_moe_stage_kernel(
     }
 }
 
-torch::Tensor nvfp4_moe_token_forward(
+torch::Tensor nvfp4_moe_rows_forward(
     const torch::Tensor& x,
     const torch::Tensor& indices,
     const torch::Tensor& weights,
@@ -3004,11 +3023,12 @@ torch::Tensor nvfp4_moe_token_forward(
     const torch::Tensor& w_scale1,
     const torch::Tensor& w_scale2,
     bool activation_fp4) {
-    TORCH_CHECK(x.dim() == 2 && x.size(0) == 1, "x must be [1, hidden]");
+    TORCH_CHECK(x.dim() == 2 && x.size(0) >= 1, "x must be [rows, hidden]");
     TORCH_CHECK(w_scale1.numel() == w1q.size(0) && w_scale2.numel() == w2q.size(0),
                 "weight_scale_2 must hold one value per expert");
-    TORCH_CHECK(indices.dim() == 1 && weights.dim() == 1, "indices/weights must be [k]");
-    TORCH_CHECK(indices.size(0) == weights.size(0), "indices/weights length mismatch");
+    TORCH_CHECK(indices.dim() == 2 && weights.dim() == 2, "indices/weights must be [rows, k]");
+    TORCH_CHECK(indices.sizes() == weights.sizes(), "indices/weights shape mismatch");
+    TORCH_CHECK(indices.size(0) == x.size(0), "one route row per activation row");
     TORCH_CHECK(w1q.dim() == 3 && w2q.dim() == 3 && w3q.dim() == 3,
                 "weights must be [E, out, in/2]");
     const int64_t hidden = w1q.size(2) * 2;
@@ -3028,13 +3048,17 @@ torch::Tensor nvfp4_moe_token_forward(
     TORCH_CHECK(w2q.is_cuda() && w2q.is_contiguous(), "w2q must be a contiguous CUDA tensor");
     TORCH_CHECK(w2s.is_cuda() && w2s.is_contiguous(), "w2s must be a contiguous CUDA tensor");
 
-    auto out = torch::zeros({1, hidden}, x.options());
-    const int topk = static_cast<int>(indices.size(0));
+    const int64_t rows = x.size(0);
+    const int topk = static_cast<int>(indices.size(1));
+    auto out = torch::zeros({rows, hidden}, x.options());
     // Two launches so both projections can use the grid. The gate/up stage writes a full-width
     // `act`, which is what lets the down stage be split by column at all.
     // One SwiGLU row per route: the two stages are separate launches, so the intermediate has to
     // carry the route it belongs to.
-    auto act = torch::empty({topk, inter}, x.options());
+    // Zeroed, not empty: under a captured graph the allocation address is fixed and reused, so a
+    // route this rank does not own would otherwise leave the previous step's SwiGLU row there for
+    // the down stage to read. Eager hid that -- every call got fresh memory.
+    auto act = torch::zeros({rows * topk, inter}, x.options());
     // One warp a column, eight warps a block: the grid is sized by columns, not by columns/256.
     // The previous cap gave `min(68, 3) = 3` blocks for 640 columns, i.e. 24 warps doing 130
     // memory round trips each -- which is why a route cost 500 us to read 3.3 MB.
@@ -3043,7 +3067,9 @@ torch::Tensor nvfp4_moe_token_forward(
     const int warps_per_block = 4;
     const int gate_blocks = static_cast<int>((inter + warps_per_block - 1) / warps_per_block);
     const size_t gate_shmem = static_cast<size_t>(hidden) * sizeof(float);
-    nvfp4_gate_up_kernel<<<gate_blocks, 256, gate_shmem, at::cuda::getCurrentCUDAStream()>>>(
+    nvfp4_gate_up_kernel<<<dim3(static_cast<unsigned>(gate_blocks), 1,
+                                static_cast<unsigned>(rows)),
+                           256, gate_shmem, at::cuda::getCurrentCUDAStream()>>>(
         x.data_ptr<float>(),
         indices.data_ptr<int64_t>(),
         weights.data_ptr<float>(),
@@ -3056,10 +3082,13 @@ torch::Tensor nvfp4_moe_token_forward(
         static_cast<int>(hidden),
         static_cast<int>(inter),
         static_cast<float>(swiglu_limit),
-        w_scale1.data_ptr<float>());
+        w_scale1.data_ptr<float>(),
+        static_cast<int>(rows));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     const int down_blocks = static_cast<int>((hidden + warps_per_block - 1) / warps_per_block);
-    nvfp4_down_kernel<<<down_blocks, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+    nvfp4_down_kernel<<<dim3(static_cast<unsigned>(down_blocks), 1,
+                              static_cast<unsigned>(rows)),
+                         256, 0, at::cuda::getCurrentCUDAStream()>>>(
         act.data_ptr<float>(),
         indices.data_ptr<int64_t>(),
         weights.data_ptr<float>(),
@@ -3070,9 +3099,35 @@ torch::Tensor nvfp4_moe_token_forward(
         static_cast<int>(experts_start_idx),
         static_cast<int>(hidden),
         static_cast<int>(inter),
-        w_scale2.data_ptr<float>());
+        w_scale2.data_ptr<float>(),
+        static_cast<int>(rows));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
+}
+
+torch::Tensor nvfp4_moe_token_forward(
+    const torch::Tensor& x,
+    const torch::Tensor& indices,
+    const torch::Tensor& weights,
+    const torch::Tensor& w1q, const torch::Tensor& w1s,
+    const torch::Tensor& w3q, const torch::Tensor& w3s,
+    const torch::Tensor& w2q, const torch::Tensor& w2s,
+    int64_t experts_start_idx,
+    double swiglu_limit,
+    double x_scale,
+    double down_scale,
+    const torch::Tensor& w_scale1,
+    const torch::Tensor& w_scale2,
+    bool activation_fp4) {
+    // One row is the K-row call with K=1; kept as its own entry point because that is what the decode
+    // step asks for and what the diagnostics below call.
+    return nvfp4_moe_rows_forward(
+        x.reshape({1, x.size(-1)}),
+        indices.reshape({1, -1}),
+        weights.reshape({1, -1}),
+        w1q, w1s, w3q, w3s, w2q, w2s,
+        experts_start_idx, swiglu_limit, x_scale, down_scale,
+        w_scale1, w_scale2, activation_fp4);
 }
 
 // Same kernel, keeping the intermediates. Returns `(out, gate, up, act, x_used)` for the first

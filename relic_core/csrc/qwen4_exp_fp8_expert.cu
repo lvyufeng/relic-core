@@ -32,6 +32,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/util/BFloat16.h>
 #include <cuda_runtime.h>
+#include <cstdlib>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -633,6 +634,21 @@ torch::Tensor qwen4_exp_fp8_slots_swiglu_cuda(
     // The act phase took one block a slot and walked every row with eight warps; it now takes
     // the split the down phase already took, so both phases fill the card.
     const int act_blocks = blocks;
+    // The down phase's split is priced separately from the act phase's, because one number for
+    // both cannot tell which phase a change helped or hurt.
+    //
+    // It was split out on the theory that the down phase is latency-bound at decode -- ten slots,
+    // only ~1.25 of them owned by this rank, so a grid of (4, 10) leaves roughly five CTAs doing
+    // real work on a 128-SM card -- and that more blocks would therefore be faster. Measured on
+    // eight RTX 4090s at 8192 positions, three interleaved rounds an arm, tokens identical
+    // throughout: 4 blocks 45.37 tok/s, 8 blocks 33.05, 16 blocks 39.82. The theory was wrong --
+    // extra blocks cost more in re-reading the activation than they recover in parallelism, and 4
+    // is the optimum. The knob stays because it is the right shape for measuring this, with 4
+    // still the default.
+    int down_blocks = blocks;
+    if (const char* down_env = std::getenv("POCKETLLM_QWEN4_FP8_EXPERT_DOWN_BLOCKS")) {
+        down_blocks = static_cast<int>(std::max<long>(1, std::strtol(down_env, nullptr, 10)));
+    }
 
     auto act = torch::empty({slots, static_cast<int64_t>(inter)}, x.options());
     const auto* x_bf = reinterpret_cast<const __nv_bfloat16*>(x.const_data_ptr());
@@ -655,7 +671,7 @@ torch::Tensor qwen4_exp_fp8_slots_swiglu_cuda(
         x_bf, gu_t_u8, gu_bf, act_bf, ids, x_stride, gate_scale_cols, hidden, inter);
     }
     if (getenv("NODOWN") == nullptr) {
-    fp8_expert_down_kernel<<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(slots)),
+    fp8_expert_down_kernel<<<dim3(static_cast<unsigned>(down_blocks), static_cast<unsigned>(slots)),
                              kExpertThreads, 0, stream>>>(
         dw_u8, dw_bf, act_bf, w_bf, ids, out_bf, down_scale_cols, hidden, inter);
     }
