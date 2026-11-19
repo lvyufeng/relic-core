@@ -257,12 +257,21 @@ std::vector<torch::Tensor> qwen4_exp_gated_delta_bf16_forward_cuda(
     const torch::Tensor& beta,
     const torch::Tensor& initial_state,
     double norm_eps,
-    int64_t groups_per_block);
+    int64_t groups_per_block,
+    const c10::optional<torch::Tensor>& states_out = c10::nullopt);
 
 void qwen4_exp_gather_rows_bf16_cuda(
     const void* src_host,
     const torch::Tensor& index,
     torch::Tensor& out);
+
+void qwen4_exp_hc_down_inject_cuda(
+    const torch::Tensor& normed,
+    const torch::Tensor& mix_down,
+    const torch::Tensor& block_inject,
+    torch::Tensor& down_out,
+    torch::Tensor& inject_out,
+    int64_t hc);
 
 void qwen4_exp_hc_up_mix_cuda(
     const torch::Tensor& down,
@@ -291,6 +300,20 @@ torch::Tensor qwen4_exp_qsa_bf16_forward_cuda(
     const torch::Tensor& selected,
     double softmax_scale);
 
+torch::Tensor qwen4_exp_qsa_splitk_bf16_forward_cuda(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& selected,
+    double softmax_scale);
+
+torch::Tensor qwen4_exp_qsa_splitk_rows_bf16_forward_cuda(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& selected,
+    double softmax_scale);
+
 torch::Tensor qwen4_exp_grouped_rms_norm_cuda(
     const torch::Tensor& input,
     const torch::Tensor& weight,
@@ -310,6 +333,19 @@ torch::Tensor qwen4_exp_hc_silu_bf16_cuda(
 torch::Tensor qwen4_exp_hc_inject_gate_bf16_cuda(
     const torch::Tensor& input,
     int64_t groups);
+
+torch::Tensor qwen4_exp_gated_rms_norm_exact_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& inv_rms,
+    const torch::Tensor& weight,
+    const torch::Tensor& gate_activated);
+
+torch::Tensor qwen4_exp_gated_rms_norm_exact_act_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& inv_rms,
+    const torch::Tensor& weight,
+    const torch::Tensor& gate,
+    int64_t activation);
 
 torch::Tensor qwen4_exp_grouped_rms_norm(
     const torch::Tensor& input,
@@ -376,6 +412,23 @@ torch::Tensor qwen4_exp_hc_silu(const torch::Tensor& input, int64_t groups) {
     return qwen4_exp_hc_silu_bf16_cuda(input, groups);
 }
 
+torch::Tensor qwen4_exp_gated_rms_norm_exact(
+    const torch::Tensor& x,
+    const torch::Tensor& inv_rms,
+    const torch::Tensor& weight,
+    const torch::Tensor& gate_activated) {
+    return qwen4_exp_gated_rms_norm_exact_cuda(x, inv_rms, weight, gate_activated);
+}
+
+torch::Tensor qwen4_exp_gated_rms_norm_exact_act(
+    const torch::Tensor& x,
+    const torch::Tensor& inv_rms,
+    const torch::Tensor& weight,
+    const torch::Tensor& gate,
+    int64_t activation) {
+    return qwen4_exp_gated_rms_norm_exact_act_cuda(x, inv_rms, weight, gate, activation);
+}
+
 torch::Tensor qwen4_exp_hc_inject_gate(const torch::Tensor& input, int64_t groups) {
     check_qwen4_exp_hc_activation(input, groups);
     return qwen4_exp_hc_inject_gate_bf16_cuda(input, groups);
@@ -414,6 +467,29 @@ torch::Tensor qwen4_exp_gather_runs_bf16(
     qwen4_exp_gather_runs_bf16_cuda(
         reinterpret_cast<const void*>(src_address), run_start, run_rows, run_dst, run_count, out);
     return out;
+}
+
+std::vector<torch::Tensor> qwen4_exp_hc_down_inject(
+    const torch::Tensor& normed,
+    const torch::Tensor& mix_down,
+    const torch::Tensor& block_inject,
+    int64_t hc) {
+    TORCH_CHECK(normed.is_cuda() && mix_down.is_cuda() && block_inject.is_cuda(),
+                "operands must be CUDA");
+    TORCH_CHECK(normed.is_contiguous() && mix_down.is_contiguous() && block_inject.is_contiguous(),
+                "operands must be contiguous");
+    TORCH_CHECK(normed.scalar_type() == torch::kBFloat16 && mix_down.scalar_type() == torch::kBFloat16 &&
+                    block_inject.scalar_type() == torch::kBFloat16,
+                "operands must be bfloat16");
+    const auto width = normed.size(-1);
+    TORCH_CHECK(mix_down.size(-1) == width && block_inject.size(-1) == width,
+                "both weights must be as wide as the normalised input");
+    TORCH_CHECK(block_inject.size(0) == hc, "block_inject must be [hc, hc * hidden]");
+    auto options = torch::TensorOptions().dtype(torch::kBFloat16).device(normed.device());
+    auto down = torch::empty({normed.size(0), mix_down.size(0)}, options);
+    auto inject = torch::empty({normed.size(0), hc}, options);
+    qwen4_exp_hc_down_inject_cuda(normed, mix_down, block_inject, down, inject, hc);
+    return {down, inject};
 }
 
 torch::Tensor qwen4_exp_hc_up_mix(
@@ -480,6 +556,72 @@ torch::Tensor qwen4_exp_qsa_bf16_forward(
         query, key, value, selected, softmax_scale);
 }
 
+// Split-K override for the decode shape. It repeats the shared validation rather than factoring it
+// out, because the two entry points are expected to diverge: this one is decode-only.
+torch::Tensor qwen4_exp_qsa_splitk_bf16_forward(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& selected,
+    double softmax_scale) {
+    TORCH_CHECK(query.dim() == 4, "query must have shape [B, Q, Hq, 256]");
+    TORCH_CHECK(key.dim() == 4, "key must have shape [B, Hkv, K, 256]");
+    TORCH_CHECK(value.sizes() == key.sizes(), "value shape must match key");
+    TORCH_CHECK(selected.dim() == 3, "selected must have shape [B, Q, S]");
+    TORCH_CHECK(query.size(0) == key.size(0), "query/key batch mismatch");
+    TORCH_CHECK(selected.size(0) == query.size(0) && selected.size(1) == query.size(1), "selected/query shape mismatch");
+    TORCH_CHECK(query.size(3) == 256 && key.size(3) == 256, "Qwen4-Exp QSA requires 256-dimensional heads");
+    TORCH_CHECK(key.size(1) > 0 && query.size(2) % key.size(1) == 0, "query heads must be divisible by KV heads");
+    TORCH_CHECK(query.size(2) / key.size(1) <= 12, "Qwen4-Exp QSA supports at most 12 query heads per KV head");
+    TORCH_CHECK(selected.size(2) > 0, "selected must contain at least one slot");
+    TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda() && selected.is_cuda(), "QSA inputs must be CUDA tensors");
+    TORCH_CHECK(query.device() == key.device() && query.device() == value.device() && query.device() == selected.device(), "QSA inputs must share one CUDA device");
+    TORCH_CHECK(query.is_contiguous() && key.is_contiguous() && value.is_contiguous() && selected.is_contiguous(), "QSA inputs must be contiguous");
+    TORCH_CHECK(query.scalar_type() == torch::kBFloat16 && key.scalar_type() == torch::kBFloat16 && value.scalar_type() == torch::kBFloat16, "query/key/value must be bfloat16");
+    TORCH_CHECK(selected.scalar_type() == torch::kInt32, "selected must be int32");
+    TORCH_CHECK(softmax_scale > 0.0, "softmax_scale must be positive");
+    // The split-K kernel is one query row against one selection: it has no query-row loop. A
+    // prefill call has hundreds of rows and a selection per row, so it must stay on the general op
+    // or it would compute a fraction of the work and answer zeros.
+    TORCH_CHECK(query.size(1) == 1, "split-K QSA is decode-only; use qwen4_exp_qsa_bf16_forward for prefill");
+    TORCH_CHECK(selected.size(2) <= 4096, "split-K QSA supports at most 4096 selected positions");
+    return qwen4_exp_qsa_splitk_bf16_forward_cuda(
+        query, key, value, selected, softmax_scale);
+}
+
+// A separate entry preserves the existing single-query operation as the exactness oracle.
+torch::Tensor qwen4_exp_qsa_splitk_rows_bf16_forward(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& selected,
+    double softmax_scale) {
+    TORCH_CHECK(query.dim() == 4, "query must have shape [B, Q, Hq, 256]");
+    TORCH_CHECK(key.dim() == 4, "key must have shape [B, Hkv, K, 256]");
+    TORCH_CHECK(value.sizes() == key.sizes(), "value shape must match key");
+    TORCH_CHECK(selected.dim() == 3, "selected must have shape [B, Q, S]");
+    TORCH_CHECK(query.size(0) == key.size(0), "query/key batch mismatch");
+    TORCH_CHECK(selected.size(0) == query.size(0) && selected.size(1) == query.size(1), "selected/query shape mismatch");
+    TORCH_CHECK(query.size(3) == 256 && key.size(3) == 256, "Qwen4-Exp QSA requires 256-dimensional heads");
+    TORCH_CHECK(query.size(2) > 0 && key.size(1) > 0 && query.size(2) % key.size(1) == 0, "query heads must be divisible by KV heads");
+    TORCH_CHECK(query.size(2) / key.size(1) <= 12, "Qwen4-Exp QSA supports at most 12 query heads per KV head");
+    TORCH_CHECK(selected.size(2) > 0, "selected must contain at least one slot");
+    TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda() && selected.is_cuda(), "QSA inputs must be CUDA tensors");
+    TORCH_CHECK(query.device() == key.device() && query.device() == value.device() && query.device() == selected.device(), "QSA inputs must share one CUDA device");
+    TORCH_CHECK(query.is_contiguous() && key.is_contiguous() && value.is_contiguous() && selected.is_contiguous(), "QSA inputs must be contiguous");
+    TORCH_CHECK(query.scalar_type() == torch::kBFloat16 && key.scalar_type() == torch::kBFloat16 && value.scalar_type() == torch::kBFloat16, "query/key/value must be bfloat16");
+    TORCH_CHECK(selected.scalar_type() == torch::kInt32, "selected must be int32");
+    TORCH_CHECK(softmax_scale > 0.0, "softmax_scale must be positive");
+    // Each query gets an independent z-plane of the same sixteen-split reduction. Batch storage is
+    // deliberately not generalized: the new operation is for one request's small verify span only.
+    TORCH_CHECK(query.size(0) == 1, "small-query split-K QSA supports batch size 1 only");
+    TORCH_CHECK(query.size(1) >= 1 && query.size(1) <= 8,
+                "small-query split-K QSA supports 1 to 8 query rows");
+    TORCH_CHECK(selected.size(2) <= 4096, "split-K QSA supports at most 4096 selected positions");
+    return qwen4_exp_qsa_splitk_rows_bf16_forward_cuda(
+        query, key, value, selected, softmax_scale);
+}
+
 std::vector<torch::Tensor> qwen4_exp_gated_delta_bf16_forward(
     const torch::Tensor& query,
     const torch::Tensor& key,
@@ -511,6 +653,30 @@ std::vector<torch::Tensor> qwen4_exp_gated_delta_bf16_forward(
     TORCH_CHECK(groups_per_block == 1 || groups_per_block == 2 || groups_per_block == 4 || groups_per_block == 8, "groups_per_block must be 1, 2, 4, or 8");
     return qwen4_exp_gated_delta_bf16_forward_cuda(
         query, key, value, gate, beta, initial_state, norm_eps, groups_per_block);
+}
+
+std::vector<torch::Tensor> qwen4_exp_gated_delta_bf16_forward_states(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& gate,
+    const torch::Tensor& beta,
+    const torch::Tensor& initial_state,
+    double norm_eps,
+    int64_t groups_per_block) {
+    // A speculative verify round runs K positions and keeps only an accepted prefix, so the linear
+    // layers have to be put back to the state after position k rather than to the end of the
+    // forward. The scan already passes through every one of those states; this hands them back.
+    const int64_t rows = query.size(1);
+    const int64_t heads = value.size(2);
+    auto states = torch::empty(
+        {rows, heads, 128, 128},
+        initial_state.options().dtype(torch::kFloat32));
+    auto out = qwen4_exp_gated_delta_bf16_forward_cuda(
+        query, key, value, gate, beta, initial_state, norm_eps, groups_per_block,
+        c10::optional<torch::Tensor>(states));
+    out.push_back(states);
+    return out;
 }
 
 torch::Tensor qwen4_exp_moe_prefill_bf16_forward(
@@ -1819,6 +1985,82 @@ torch::Tensor nvfp4_moe_token_forward(
     const torch::Tensor& w_scale2,
     bool activation_fp4);
 
+torch::Tensor nvfp4_moe_rows_forward(
+    const torch::Tensor& x,
+    const torch::Tensor& indices,
+    const torch::Tensor& weights,
+    const torch::Tensor& w1q, const torch::Tensor& w1s,
+    const torch::Tensor& w3q, const torch::Tensor& w3s,
+    const torch::Tensor& w2q, const torch::Tensor& w2s,
+    int64_t experts_start_idx,
+    double swiglu_limit,
+    double x_scale,
+    double down_scale,
+    const torch::Tensor& w_scale1,
+    const torch::Tensor& w_scale2,
+    bool activation_fp4);
+
+// Exact-operand twin of `nvfp4_moe_rows_forward`. Defined in `qwen4_exp_nvfp4_exact.cu` so the
+// decoder can be replaced without recompiling the giant implementation unit; the old entry stays
+// unchanged and is this one's equality oracle.
+torch::Tensor nvfp4_moe_rows_forward_exact_fast(
+    const torch::Tensor& x,
+    const torch::Tensor& indices,
+    const torch::Tensor& weights,
+    const torch::Tensor& w1q, const torch::Tensor& w1s,
+    const torch::Tensor& w3q, const torch::Tensor& w3s,
+    const torch::Tensor& w2q, const torch::Tensor& w2s,
+    int64_t experts_start_idx,
+    double swiglu_limit,
+    double x_scale,
+    double down_scale,
+    const torch::Tensor& w_scale1,
+    const torch::Tensor& w_scale2,
+    bool activation_fp4);
+
+// Compact launch twin of `nvfp4_moe_rows_forward_exact_fast`: identical signature, kernels, grid
+// and column partition, launched with the four warps a block can keep busy instead of eight. Its
+// old twin above is the equality oracle, so a difference here is a defect rather than a tolerance.
+torch::Tensor nvfp4_moe_rows_forward_exact_fast_compact(
+    const torch::Tensor& x,
+    const torch::Tensor& indices,
+    const torch::Tensor& weights,
+    const torch::Tensor& w1q, const torch::Tensor& w1s,
+    const torch::Tensor& w3q, const torch::Tensor& w3s,
+    const torch::Tensor& w2q, const torch::Tensor& w2s,
+    int64_t experts_start_idx,
+    double swiglu_limit,
+    double x_scale,
+    double down_scale,
+    const torch::Tensor& w_scale1,
+    const torch::Tensor& w_scale2,
+    bool activation_fp4);
+
+// Ordered single-writer epilogue of the exact-operand rows path: a column outer loop with the
+// routes inside, one register accumulation and one store per output element, and no zero fill for
+// either the output or the SwiGLU staging buffer. Still an independent experiment -- the equality
+// oracle above is the specification, and `tests/test_nvfp4_exact_store.py` is what decides whether
+// this entry may be selected.
+torch::Tensor nvfp4_moe_rows_forward_exact_fast_store(
+    const torch::Tensor& x,
+    const torch::Tensor& indices,
+    const torch::Tensor& weights,
+    const torch::Tensor& w1q, const torch::Tensor& w1s,
+    const torch::Tensor& w3q, const torch::Tensor& w3s,
+    const torch::Tensor& w2q, const torch::Tensor& w2s,
+    int64_t experts_start_idx,
+    double swiglu_limit,
+    double x_scale,
+    double down_scale,
+    const torch::Tensor& w_scale1,
+    const torch::Tensor& w_scale2,
+    bool activation_fp4);
+
+// Decoder witnesses: readable float bits for the two format decoders, so the operand values can be
+// tested directly instead of only through a MoE result.
+torch::Tensor nvfp4_exact_decode_e2m1(const torch::Tensor& codes);
+torch::Tensor nvfp4_exact_decode_e4m3(const torch::Tensor& bytes);
+
 torch::Tensor moe_single_token_fp4_forward(
     const torch::Tensor& x,
     const torch::Tensor& indices,
@@ -2423,6 +2665,16 @@ void fused_minimax_rope_halfsplit_inplace(
     fused_minimax_rope_halfsplit_inplace_cuda(x, freqs_cos, freqs_sin);
 }
 
+// Independent candidate for the hyper-connection up-mix. It is an experimental entry: the qualified
+// original stays bound as `qwen4_exp_hc_up_mix`, so a bit comparison always has its oracle present.
+torch::Tensor qwen4_exp_hc_up_mix_exact(
+    const torch::Tensor& down,
+    const torch::Tensor& mix_up,
+    const torch::Tensor& normed,
+    int64_t hc,
+    int64_t hidden,
+    int64_t threads);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("custom_allreduce_ipc_handle", &custom_allreduce_ipc_handle, "export custom allreduce CUDA IPC handles");
     m.def("custom_allreduce_open", &custom_allreduce_open, "open custom allreduce CUDA IPC handles");
@@ -2481,6 +2733,88 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("down_scale") = 1.0,
         pybind11::arg("w_scale1"), pybind11::arg("w_scale2"),
         pybind11::arg("activation_fp4") = true);
+    m.def(
+        "nvfp4_moe_rows_forward",
+        &nvfp4_moe_rows_forward,
+        "ModelOpt NVFP4 top-k MoE for K rows at once: x [rows, hidden], indices/weights [rows, k]. "
+        "The K-row form of `nvfp4_moe_token_forward`, so a prefill chunk or an MTP verify round is one "
+        "launch pair instead of one a row. (CUDA)",
+        pybind11::arg("x"), pybind11::arg("indices"), pybind11::arg("weights"),
+        pybind11::arg("w1q"), pybind11::arg("w1s"),
+        pybind11::arg("w3q"), pybind11::arg("w3s"),
+        pybind11::arg("w2q"), pybind11::arg("w2s"),
+        pybind11::arg("experts_start_idx") = 0,
+        pybind11::arg("swiglu_limit") = 0.0,
+        pybind11::arg("x_scale") = 1.0,
+        pybind11::arg("down_scale") = 1.0,
+        pybind11::arg("w_scale1"), pybind11::arg("w_scale2"),
+        pybind11::arg("activation_fp4") = true);
+    m.def(
+        "nvfp4_moe_rows_forward_exact_fast",
+        &nvfp4_moe_rows_forward_exact_fast,
+        "Exact-operand twin of `nvfp4_moe_rows_forward`: identical signature and arithmetic, with "
+        "the E2M1 and E4M3 decoders built from register constants instead of a divergent constant-"
+        "memory table and a libdevice ldexp. Bit-identical output is a test requirement, not an "
+        "assumption. (CUDA)",
+        pybind11::arg("x"), pybind11::arg("indices"), pybind11::arg("weights"),
+        pybind11::arg("w1q"), pybind11::arg("w1s"),
+        pybind11::arg("w3q"), pybind11::arg("w3s"),
+        pybind11::arg("w2q"), pybind11::arg("w2s"),
+        pybind11::arg("experts_start_idx") = 0,
+        pybind11::arg("swiglu_limit") = 0.0,
+        pybind11::arg("x_scale") = 1.0,
+        pybind11::arg("down_scale") = 1.0,
+        pybind11::arg("w_scale1"), pybind11::arg("w_scale2"),
+        pybind11::arg("activation_fp4") = true);
+    m.def(
+        "nvfp4_moe_rows_forward_exact_fast_compact",
+        &nvfp4_moe_rows_forward_exact_fast_compact,
+        "Compact launch of the exact-operand NVFP4 MoE rows path: the same kernels, grid, column "
+        "partition and arithmetic as `nvfp4_moe_rows_forward_exact_fast`, launched with four warps "
+        "a block instead of eight. Bit-identical output to that entry is a test requirement. Only "
+        "the launch occupies fewer warp slots; the grid and every column's accumulation are "
+        "unchanged. (CUDA)",
+        pybind11::arg("x"), pybind11::arg("indices"), pybind11::arg("weights"),
+        pybind11::arg("w1q"), pybind11::arg("w1s"),
+        pybind11::arg("w3q"), pybind11::arg("w3s"),
+        pybind11::arg("w2q"), pybind11::arg("w2s"),
+        pybind11::arg("experts_start_idx") = 0,
+        pybind11::arg("swiglu_limit") = 0.0,
+        pybind11::arg("x_scale") = 1.0,
+        pybind11::arg("down_scale") = 1.0,
+        pybind11::arg("w_scale1"), pybind11::arg("w_scale2"),
+        pybind11::arg("activation_fp4") = true);
+    m.def(
+        "nvfp4_moe_rows_forward_exact_fast_store",
+        &nvfp4_moe_rows_forward_exact_fast_store,
+        "Ordered single-writer epilogue of the exact-operand NVFP4 MoE rows path: the same gate/up "
+        "stage, a down stage that accumulates each output element's routed contributions in a "
+        "register in ascending route order and stores it once, and no zero fill of either the "
+        "output or the SwiGLU staging buffer. Launched with four warps a block. Bit-identical "
+        "output to `nvfp4_moe_rows_forward` is a test requirement, and this entry stays an "
+        "independent experiment until that device oracle passes. (CUDA)",
+        pybind11::arg("x"), pybind11::arg("indices"), pybind11::arg("weights"),
+        pybind11::arg("w1q"), pybind11::arg("w1s"),
+        pybind11::arg("w3q"), pybind11::arg("w3s"),
+        pybind11::arg("w2q"), pybind11::arg("w2s"),
+        pybind11::arg("experts_start_idx") = 0,
+        pybind11::arg("swiglu_limit") = 0.0,
+        pybind11::arg("x_scale") = 1.0,
+        pybind11::arg("down_scale") = 1.0,
+        pybind11::arg("w_scale1"), pybind11::arg("w_scale2"),
+        pybind11::arg("activation_fp4") = true);
+    m.def(
+        "nvfp4_exact_decode_e2m1",
+        &nvfp4_exact_decode_e2m1,
+        "Witness for the exact E2M1 decoder: one float32 per incoming nibble (low four bits). "
+        "Values are the same bits `nvfp4_moe_rows_forward` reads, exposed so they can be asserted "
+        "against the format definition. (CUDA)");
+    m.def(
+        "nvfp4_exact_decode_e4m3",
+        &nvfp4_exact_decode_e4m3,
+        "Witness for the exact E4M3 decoder: one float32 per incoming scale byte, all 256 bit "
+        "patterns finite including 0x7F/0xFF, which the format reserves as NaN but the NVFP4 path "
+        "treats as 480. (CUDA)");
     m.def("mimo_decode_attention", &mimo_decode_attention,
           "MiMo-V2.6's decode-step attention: the span's scores, its softmax with the sink column, "
           "and the values mixed, for one row",
@@ -2518,9 +2852,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("qwen4_exp_fp8_gemv_t_bf16", &qwen4_exp_fp8_gemv_t_bf16_cuda,
           "Qwen4-Exp single FP8 GEMV over a packed plane, block scale fused into the load (CUDA)");
     m.def("qwen4_exp_gated_delta_bf16_forward", &qwen4_exp_gated_delta_bf16_forward, "Qwen4-Exp BF16 gated-delta recurrent scan (CUDA)");
+    m.def("qwen4_exp_gated_delta_bf16_forward_states", &qwen4_exp_gated_delta_bf16_forward_states, "Qwen4-Exp BF16 gated-delta recurrent scan, also returning the state after every position -- what a speculative verify round rewinds to (CUDA)");
     m.def("qwen4_exp_qsa_bf16_forward", &qwen4_exp_qsa_bf16_forward, "Qwen4-Exp indexed BF16 GQA attention (CUDA)");
+    m.def("qwen4_exp_qsa_splitk_bf16_forward", &qwen4_exp_qsa_splitk_bf16_forward, "Qwen4-Exp indexed BF16 GQA attention, split-K decode path (CUDA)");
+    m.def("qwen4_exp_qsa_splitk_rows_bf16_forward", &qwen4_exp_qsa_splitk_rows_bf16_forward, "Qwen4-Exp indexed BF16 GQA attention, exact small-query split-K path (CUDA)");
+    m.def("qwen4_exp_hc_down_inject", &qwen4_exp_hc_down_inject,
+          "Hyper-connection mixer: both input projections from one pass, silu and gate applied");
     m.def("qwen4_exp_hc_up_mix", &qwen4_exp_hc_up_mix,
           "Hyper-connection mixer: up projection, sigmoid gate and stream fold in one kernel (CUDA)");
+    m.def("qwen4_exp_hc_up_mix_exact", &qwen4_exp_hc_up_mix_exact,
+          "Hyper-connection mixer: four stream dots from one activation read, bit-identical fold (CUDA)",
+          pybind11::arg("down"), pybind11::arg("mix_up"), pybind11::arg("normed"),
+          pybind11::arg("hc"), pybind11::arg("hidden"), pybind11::arg("threads") = 128);
     m.def("qwen4_exp_gather_runs_bf16", &qwen4_exp_gather_runs_bf16,
           "Gather whole runs of a host-resident arena into the device (zero-copy, CUDA)");
     m.def("qwen4_exp_scatter_rows_bf16", &qwen4_exp_scatter_rows_bf16,
@@ -2537,6 +2880,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("scale"), pybind11::arg("hc_mult"), pybind11::arg("sinkhorn_iters"),
           pybind11::arg("eps"), pybind11::arg("clamp_min"), pybind11::arg("clamp_max"));
     m.def("qwen4_exp_hc_silu", &qwen4_exp_hc_silu, "Qwen4-Exp hyper-connection scaled SiLU (CUDA)");
+    m.def("qwen4_exp_gated_rms_norm_exact", &qwen4_exp_gated_rms_norm_exact,
+          "Qwen4-Exp GDN gated RMSNorm epilogue with the activation precomputed in float32: the "
+          "three BF16 rounding boundaries of the reference are preserved bit for bit (CUDA)",
+          pybind11::arg("x"), pybind11::arg("inv_rms"), pybind11::arg("weight"),
+          pybind11::arg("gate_activated"));
+    m.def("qwen4_exp_gated_rms_norm_exact_act", &qwen4_exp_gated_rms_norm_exact_act,
+          "Qwen4-Exp GDN gated RMSNorm epilogue with sigmoid/silu evaluated in the kernel. NOT "
+          "proven bit-identical to torch's float32 activation; on-device oracle required before "
+          "any runtime enables it (CUDA)",
+          pybind11::arg("x"), pybind11::arg("inv_rms"), pybind11::arg("weight"),
+          pybind11::arg("gate"), pybind11::arg("activation"));
     m.def("qwen4_exp_hc_inject_gate", &qwen4_exp_hc_inject_gate, "Qwen4-Exp hyper-connection injection gate (CUDA)");
     m.def("moe_prefill_int8_grouped_gemm_forward", &moe_prefill_int8_grouped_gemm_forward, "prefill MoE grouped-GEMM int8 forward (CUDA)");
     m.def("moe_prefill_fp4_grouped_gemm_forward", &moe_prefill_fp4_grouped_gemm_forward, "prefill MoE grouped-GEMM FP4 forward (CUDA)");
