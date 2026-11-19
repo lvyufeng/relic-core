@@ -7,7 +7,7 @@ relaxed CUDA guard in `Block.hc_post()` that lets long prefill skip the
 
 Run inside the deepseek conda env, e.g.:
   CUDA_VISIBLE_DEVICES=0 PYTHONPATH=$PWD \
-    /home/lvyufeng/miniconda3/envs/deepseek/bin/python tests/test_hc_cuda.py
+    /home/<user>/miniconda3/envs/deepseek/bin/python tests/test_hc_cuda.py
 """
 
 import os
