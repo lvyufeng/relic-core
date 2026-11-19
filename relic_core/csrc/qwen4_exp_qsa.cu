@@ -445,6 +445,430 @@ void launch_qsa(
             softmax_scale);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Split-K decode path.
+//
+// The scalar and MMA kernels above launch `grid = (batch * query_len, kv_heads)`, which for a
+// batch-1 decode step with one KV head a rank is a *single* CTA, and it walks the whole selection
+// in tiles of `kMmaKvTile` with a barrier between each. One SM of the card's 128 does the work, so
+// the launch measures ~294 us for about 6.3 MFLOP -- roughly 150 times its bandwidth floor.
+//
+// This path splits the selection across `kSplitK` CTAs, each keeping its own running max, running
+// sum and partial output (flash-decoding's first pass), and combines them in a second short kernel.
+// Sixteen splits put 32 CTAs on the work and shorten the serial chain from 64 tiles to 4.
+//
+// It is decode-only by construction: one query row. A prefill call has one selection per query row
+// and hundreds of rows, and dispatching that here would compute a fraction of the work and answer
+// zeros -- which is exactly what an early prototype of this measured before the shapes were
+// printed. `qwen4_exp_qsa_splitk_bf16_forward` therefore checks `query.size(1) == 1` and the
+// existing op stays in place for everything else.
+// ---------------------------------------------------------------------------------------------
+
+constexpr int kSplitK = 16;
+constexpr int kSplitThreads = 256;
+constexpr int kSplitWarps = kSplitThreads / kWarpSize;
+constexpr int kSplitChunk = 256;   // a 2048 position budget over 16 splits is 128, so this is slack
+
+__device__ __forceinline__ float qsa_split_load(const c10::BFloat16* p) {
+    return static_cast<float>(*p);
+}
+
+// One CTA per (split, kv_head): its slice of the selection reduced to a running max, a running sum
+// and a partial output.
+template <int HeadsPerKv>
+__global__ __launch_bounds__(kSplitThreads) void qsa_splitk_partial_kernel(
+    const c10::BFloat16* __restrict__ query,
+    const c10::BFloat16* __restrict__ key,
+    const c10::BFloat16* __restrict__ value,
+    const int32_t* __restrict__ selected,
+    float* __restrict__ part_acc,
+    float* __restrict__ part_m,
+    float* __restrict__ part_l,
+    int kv_len,
+    int selected_len,
+    float softmax_scale) {
+    const int split = static_cast<int>(blockIdx.x);
+    const int kv_head = static_cast<int>(blockIdx.y);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & (kWarpSize - 1);
+    const int warp = tid / kWarpSize;
+
+    const int chunk = (selected_len + kSplitK - 1) / kSplitK;
+    const int begin = split * chunk;
+    const int count = min(chunk, selected_len - begin);
+
+    __shared__ float q_sh[HeadsPerKv][kDim];
+    __shared__ float scores[HeadsPerKv][kSplitChunk];
+    __shared__ int32_t ids[kSplitChunk];
+
+    const int first_head = kv_head * HeadsPerKv;
+    const c10::BFloat16* q_base = query + static_cast<int64_t>(first_head) * kDim;
+    for (int i = tid; i < HeadsPerKv * kDim; i += kSplitThreads) {
+        q_sh[i / kDim][i % kDim] = qsa_split_load(q_base + i);
+    }
+    for (int i = tid; i < count; i += kSplitThreads) {
+        ids[i] = selected[begin + i];
+    }
+    __syncthreads();
+
+    const int64_t kv_head_base = static_cast<int64_t>(kv_head) * kv_len * kDim;
+
+    // One warp a position, lane-parallel over the head dimension. Every warp walks the same number
+    // of iterations so the barrier after this loop cannot be reached by some warps and not others.
+    for (int base = 0; base < count; base += kSplitWarps) {
+        const int slot = base + warp;
+        const int token = slot < count ? ids[slot] : -1;
+        float acc[HeadsPerKv];
+#pragma unroll
+        for (int h = 0; h < HeadsPerKv; ++h) {
+            acc[h] = 0.0f;
+        }
+        if (token >= 0 && token < kv_len) {
+            const c10::BFloat16* kp =
+                key + kv_head_base + static_cast<int64_t>(token) * kDim;
+            for (int d = lane; d < kDim; d += kWarpSize) {
+                const float kv = qsa_split_load(kp + d);
+#pragma unroll
+                for (int h = 0; h < HeadsPerKv; ++h) {
+                    acc[h] += q_sh[h][d] * kv;
+                }
+            }
+        }
+#pragma unroll
+        for (int h = 0; h < HeadsPerKv; ++h) {
+            float v = acc[h];
+            for (int off = kWarpSize / 2; off > 0; off >>= 1) {
+                v += __shfl_xor_sync(0xffffffffu, v, off);
+            }
+            if (lane == 0) {
+                const bool valid = token >= 0 && token < kv_len;
+                scores[h][slot] = (valid && slot < count) ? v * softmax_scale : -INFINITY;
+            }
+        }
+    }
+    __syncthreads();
+
+    // Three phases, not one. A thread that stored `exp(score - max)` while another was still
+    // scanning for the maximum would hand it a value of at most 1, and the first version of this
+    // kernel measured cosine 0.66-0.80 against a torch reference for exactly that reason.
+    float m[HeadsPerKv];
+    float l[HeadsPerKv];
+    float out[HeadsPerKv];
+#pragma unroll
+    for (int h = 0; h < HeadsPerKv; ++h) {
+        m[h] = -INFINITY;
+        for (int slot = 0; slot < count; ++slot) {
+            m[h] = fmaxf(m[h], scores[h][slot]);
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int h = 0; h < HeadsPerKv; ++h) {
+        for (int slot = tid; slot < count; slot += kSplitThreads) {
+            scores[h][slot] = scores[h][slot] == -INFINITY
+                ? 0.0f
+                : __expf(scores[h][slot] - m[h]);
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int h = 0; h < HeadsPerKv; ++h) {
+        l[h] = 0.0f;
+        for (int slot = 0; slot < count; ++slot) {
+            l[h] += scores[h][slot];
+        }
+        out[h] = 0.0f;
+    }
+    for (int slot = 0; slot < count; ++slot) {
+        const int token = ids[slot];
+        if (token < 0 || token >= kv_len) {
+            continue;
+        }
+        const c10::BFloat16* vp =
+            value + kv_head_base + static_cast<int64_t>(token) * kDim;
+        const float vd = qsa_split_load(vp + tid);
+#pragma unroll
+        for (int h = 0; h < HeadsPerKv; ++h) {
+            out[h] += scores[h][slot] * vd;
+        }
+    }
+
+    const int64_t split_index = static_cast<int64_t>(kv_head) * kSplitK + split;
+#pragma unroll
+    for (int h = 0; h < HeadsPerKv; ++h) {
+        part_acc[split_index * HeadsPerKv * kDim
+                 + static_cast<int64_t>(h) * kDim + tid] = out[h];
+    }
+    if (tid < HeadsPerKv) {
+        part_m[split_index * HeadsPerKv + tid] = m[tid];
+        part_l[split_index * HeadsPerKv + tid] = l[tid];
+    }
+}
+
+// Second pass: combine the splits with the max and sum each of them carries.
+template <int HeadsPerKv>
+__global__ void qsa_splitk_combine_kernel(
+    const float* __restrict__ part_acc,
+    const float* __restrict__ part_m,
+    const float* __restrict__ part_l,
+    c10::BFloat16* __restrict__ output) {
+    const int kv_head = static_cast<int>(blockIdx.x);
+    const int head = static_cast<int>(blockIdx.y);
+    const int tid = static_cast<int>(threadIdx.x);
+
+    float m = -INFINITY;
+    for (int split = 0; split < kSplitK; ++split) {
+        m = fmaxf(m, part_m[(kv_head * kSplitK + split) * HeadsPerKv + head]);
+    }
+    float acc = 0.0f;
+    float denom = 0.0f;
+    for (int split = 0; split < kSplitK; ++split) {
+        const int64_t idx = static_cast<int64_t>(kv_head) * kSplitK + split;
+        const float p = part_l[idx * HeadsPerKv + head];
+        const float weight =
+            p == 0.0f ? 0.0f : __expf(part_m[idx * HeadsPerKv + head] - m);
+        denom += p * weight;
+        acc += part_acc[idx * HeadsPerKv * kDim + head * kDim + tid] * weight;
+    }
+    acc = denom == 0.0f ? 0.0f : acc / denom;
+    output[static_cast<int64_t>(kv_head * HeadsPerKv + head) * kDim + tid] =
+        c10::BFloat16(acc);
+}
+
+template <int HeadsPerKv>
+void launch_qsa_splitk(
+    const c10::BFloat16* query,
+    const c10::BFloat16* key,
+    const c10::BFloat16* value,
+    const int32_t* selected,
+    c10::BFloat16* output,
+    int kv_heads,
+    int kv_len,
+    int selected_len,
+    float softmax_scale,
+    cudaStream_t stream) {
+    auto fopts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    // The partials are scratch for one launch; allocating them here keeps the call site and the
+    // recorded graph unchanged, because the shapes are a constant of the geometry.
+    auto part_acc = torch::empty({kv_heads, kSplitK, HeadsPerKv, kDim}, fopts);
+    auto part_m = torch::empty({kv_heads, kSplitK, HeadsPerKv}, fopts);
+    auto part_l = torch::empty({kv_heads, kSplitK, HeadsPerKv}, fopts);
+
+    const dim3 grid(kSplitK, kv_heads);
+    qsa_splitk_partial_kernel<HeadsPerKv><<<grid, kSplitThreads, 0, stream>>>(
+        query, key, value, selected,
+        part_acc.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
+        kv_len, selected_len, softmax_scale);
+    const dim3 combine_grid(kv_heads, HeadsPerKv);
+    qsa_splitk_combine_kernel<HeadsPerKv><<<combine_grid, kDim, 0, stream>>>(
+        part_acc.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
+        output);
+}
+
+// Small-query split-K path. Each z plane is an independent copy of the single-query work above.
+// Only integer addressing differs: the dot, softmax and split-combine loops deliberately retain
+// the existing single-query operation order. Keep the old entry separate so its arithmetic remains
+// an independent oracle for eager and captured bit-equality checks of this new path.
+
+template <int HeadsPerKv>
+__global__ __launch_bounds__(kSplitThreads) void qsa_splitk_rows_partial_kernel(
+    const c10::BFloat16* __restrict__ query,
+    const c10::BFloat16* __restrict__ key,
+    const c10::BFloat16* __restrict__ value,
+    const int32_t* __restrict__ selected,
+    float* __restrict__ part_acc,
+    float* __restrict__ part_m,
+    float* __restrict__ part_l,
+    int kv_heads,
+    int kv_len,
+    int selected_len,
+    float softmax_scale) {
+    const int query_row = static_cast<int>(blockIdx.z);
+    const int split = static_cast<int>(blockIdx.x);
+    const int kv_head = static_cast<int>(blockIdx.y);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & (kWarpSize - 1);
+    const int warp = tid / kWarpSize;
+
+    const int chunk = (selected_len + kSplitK - 1) / kSplitK;
+    const int begin = split * chunk;
+    const int count = min(chunk, selected_len - begin);
+
+    __shared__ float q_sh[HeadsPerKv][kDim];
+    __shared__ float scores[HeadsPerKv][kSplitChunk];
+    __shared__ int32_t ids[kSplitChunk];
+
+    const int first_head = kv_head * HeadsPerKv;
+    const int64_t query_head = static_cast<int64_t>(query_row) * kv_heads * HeadsPerKv + first_head;
+    const c10::BFloat16* q_base = query + query_head * kDim;
+    for (int i = tid; i < HeadsPerKv * kDim; i += kSplitThreads) {
+        q_sh[i / kDim][i % kDim] = qsa_split_load(q_base + i);
+    }
+    for (int i = tid; i < count; i += kSplitThreads) {
+        ids[i] = selected[static_cast<int64_t>(query_row) * selected_len + begin + i];
+    }
+    __syncthreads();
+
+    const int64_t kv_head_base = static_cast<int64_t>(kv_head) * kv_len * kDim;
+
+    // One warp a position, lane-parallel over the head dimension. Every warp walks the same number
+    // of iterations so the barrier after this loop cannot be reached by some warps and not others.
+    for (int base = 0; base < count; base += kSplitWarps) {
+        const int slot = base + warp;
+        const int token = slot < count ? ids[slot] : -1;
+        float acc[HeadsPerKv];
+#pragma unroll
+        for (int h = 0; h < HeadsPerKv; ++h) {
+            acc[h] = 0.0f;
+        }
+        if (token >= 0 && token < kv_len) {
+            const c10::BFloat16* kp =
+                key + kv_head_base + static_cast<int64_t>(token) * kDim;
+            for (int d = lane; d < kDim; d += kWarpSize) {
+                const float kv = qsa_split_load(kp + d);
+#pragma unroll
+                for (int h = 0; h < HeadsPerKv; ++h) {
+                    acc[h] += q_sh[h][d] * kv;
+                }
+            }
+        }
+#pragma unroll
+        for (int h = 0; h < HeadsPerKv; ++h) {
+            float v = acc[h];
+            for (int off = kWarpSize / 2; off > 0; off >>= 1) {
+                v += __shfl_xor_sync(0xffffffffu, v, off);
+            }
+            if (lane == 0) {
+                const bool valid = token >= 0 && token < kv_len;
+                scores[h][slot] = (valid && slot < count) ? v * softmax_scale : -INFINITY;
+            }
+        }
+    }
+    __syncthreads();
+
+    // Three phases, not one. A thread that stored `exp(score - max)` while another was still
+    // scanning for the maximum would hand it a value of at most 1, and the first version of this
+    // kernel measured cosine 0.66-0.80 against a torch reference for exactly that reason.
+    float m[HeadsPerKv];
+    float l[HeadsPerKv];
+    float out[HeadsPerKv];
+#pragma unroll
+    for (int h = 0; h < HeadsPerKv; ++h) {
+        m[h] = -INFINITY;
+        for (int slot = 0; slot < count; ++slot) {
+            m[h] = fmaxf(m[h], scores[h][slot]);
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int h = 0; h < HeadsPerKv; ++h) {
+        for (int slot = tid; slot < count; slot += kSplitThreads) {
+            scores[h][slot] = scores[h][slot] == -INFINITY
+                ? 0.0f
+                : __expf(scores[h][slot] - m[h]);
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int h = 0; h < HeadsPerKv; ++h) {
+        l[h] = 0.0f;
+        for (int slot = 0; slot < count; ++slot) {
+            l[h] += scores[h][slot];
+        }
+        out[h] = 0.0f;
+    }
+    for (int slot = 0; slot < count; ++slot) {
+        const int token = ids[slot];
+        if (token < 0 || token >= kv_len) {
+            continue;
+        }
+        const c10::BFloat16* vp =
+            value + kv_head_base + static_cast<int64_t>(token) * kDim;
+        const float vd = qsa_split_load(vp + tid);
+#pragma unroll
+        for (int h = 0; h < HeadsPerKv; ++h) {
+            out[h] += scores[h][slot] * vd;
+        }
+    }
+
+    const int64_t split_index = (static_cast<int64_t>(query_row) * kv_heads + kv_head) * kSplitK + split;
+#pragma unroll
+    for (int h = 0; h < HeadsPerKv; ++h) {
+        part_acc[split_index * HeadsPerKv * kDim
+                 + static_cast<int64_t>(h) * kDim + tid] = out[h];
+    }
+    if (tid < HeadsPerKv) {
+        part_m[split_index * HeadsPerKv + tid] = m[tid];
+        part_l[split_index * HeadsPerKv + tid] = l[tid];
+    }
+}
+
+
+// Combine each query's sixteen splits independently.
+template <int HeadsPerKv>
+__global__ void qsa_splitk_rows_combine_kernel(
+    const float* __restrict__ part_acc,
+    const float* __restrict__ part_m,
+    const float* __restrict__ part_l,
+    c10::BFloat16* __restrict__ output,
+    int kv_heads) {
+    const int query_row = static_cast<int>(blockIdx.z);
+    const int kv_head = static_cast<int>(blockIdx.x);
+    const int64_t row_kv_head = static_cast<int64_t>(query_row) * kv_heads + kv_head;
+    const int head = static_cast<int>(blockIdx.y);
+    const int tid = static_cast<int>(threadIdx.x);
+
+    float m = -INFINITY;
+    for (int split = 0; split < kSplitK; ++split) {
+        m = fmaxf(m, part_m[(row_kv_head * kSplitK + split) * HeadsPerKv + head]);
+    }
+    float acc = 0.0f;
+    float denom = 0.0f;
+    for (int split = 0; split < kSplitK; ++split) {
+        const int64_t idx = row_kv_head * kSplitK + split;
+        const float p = part_l[idx * HeadsPerKv + head];
+        const float weight =
+            p == 0.0f ? 0.0f : __expf(part_m[idx * HeadsPerKv + head] - m);
+        denom += p * weight;
+        acc += part_acc[idx * HeadsPerKv * kDim + head * kDim + tid] * weight;
+    }
+    acc = denom == 0.0f ? 0.0f : acc / denom;
+    output[(row_kv_head * HeadsPerKv + head) * kDim + tid] =
+        c10::BFloat16(acc);
+}
+
+
+template <int HeadsPerKv>
+void launch_qsa_splitk_rows(
+    const c10::BFloat16* query,
+    const c10::BFloat16* key,
+    const c10::BFloat16* value,
+    const int32_t* selected,
+    c10::BFloat16* output,
+    int query_rows,
+    int kv_heads,
+    int kv_len,
+    int selected_len,
+    float softmax_scale,
+    cudaStream_t stream) {
+    auto fopts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    // The partials are scratch for one launch; allocating them here keeps the call site and the
+    // recorded graph unchanged, because the shapes are a constant of the geometry.
+    auto part_acc = torch::empty({query_rows, kv_heads, kSplitK, HeadsPerKv, kDim}, fopts);
+    auto part_m = torch::empty({query_rows, kv_heads, kSplitK, HeadsPerKv}, fopts);
+    auto part_l = torch::empty({query_rows, kv_heads, kSplitK, HeadsPerKv}, fopts);
+
+    const dim3 grid(kSplitK, kv_heads, query_rows);
+    qsa_splitk_rows_partial_kernel<HeadsPerKv><<<grid, kSplitThreads, 0, stream>>>(
+        query, key, value, selected,
+        part_acc.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
+        kv_heads, kv_len, selected_len, softmax_scale);
+    const dim3 combine_grid(kv_heads, HeadsPerKv, query_rows);
+    qsa_splitk_rows_combine_kernel<HeadsPerKv><<<combine_grid, kDim, 0, stream>>>(
+        part_acc.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
+        output, kv_heads);
+}
+
 }  // namespace
 
 torch::Tensor qwen4_exp_qsa_bf16_forward_cuda(
@@ -498,6 +922,100 @@ torch::Tensor qwen4_exp_qsa_bf16_forward_cuda(
         case 12: QWEN4_EXP_LAUNCH_QSA(12); break;
     }
 #undef QWEN4_EXP_LAUNCH_QSA
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+
+torch::Tensor qwen4_exp_qsa_splitk_bf16_forward_cuda(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& selected,
+    double softmax_scale) {
+    c10::cuda::CUDAGuard device_guard(query.device());
+    const int kv_heads = static_cast<int>(key.size(1));
+    const int kv_len = static_cast<int>(key.size(2));
+    const int selected_len = static_cast<int>(selected.size(2));
+    const int heads_per_kv = static_cast<int>(query.size(2)) / kv_heads;
+    auto output = torch::empty(query.sizes(), query.options());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+#define QWEN4_EXP_LAUNCH_QSA_SPLITK(HEADS)                                        \
+    launch_qsa_splitk<HEADS>(                                                     \
+        query.data_ptr<c10::BFloat16>(),                                          \
+        key.data_ptr<c10::BFloat16>(),                                            \
+        value.data_ptr<c10::BFloat16>(),                                          \
+        selected.data_ptr<int32_t>(),                                             \
+        output.data_ptr<c10::BFloat16>(),                                         \
+        kv_heads,                                                                 \
+        kv_len,                                                                   \
+        selected_len,                                                             \
+        static_cast<float>(softmax_scale),                                        \
+        stream)
+    switch (heads_per_kv) {
+        case 1: QWEN4_EXP_LAUNCH_QSA_SPLITK(1); break;
+        case 2: QWEN4_EXP_LAUNCH_QSA_SPLITK(2); break;
+        case 3: QWEN4_EXP_LAUNCH_QSA_SPLITK(3); break;
+        case 4: QWEN4_EXP_LAUNCH_QSA_SPLITK(4); break;
+        case 5: QWEN4_EXP_LAUNCH_QSA_SPLITK(5); break;
+        case 6: QWEN4_EXP_LAUNCH_QSA_SPLITK(6); break;
+        case 7: QWEN4_EXP_LAUNCH_QSA_SPLITK(7); break;
+        case 8: QWEN4_EXP_LAUNCH_QSA_SPLITK(8); break;
+        case 9: QWEN4_EXP_LAUNCH_QSA_SPLITK(9); break;
+        case 10: QWEN4_EXP_LAUNCH_QSA_SPLITK(10); break;
+        case 11: QWEN4_EXP_LAUNCH_QSA_SPLITK(11); break;
+        case 12: QWEN4_EXP_LAUNCH_QSA_SPLITK(12); break;
+    }
+#undef QWEN4_EXP_LAUNCH_QSA_SPLITK
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+
+torch::Tensor qwen4_exp_qsa_splitk_rows_bf16_forward_cuda(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& selected,
+    double softmax_scale) {
+    c10::cuda::CUDAGuard device_guard(query.device());
+    const int query_rows = static_cast<int>(query.size(1));
+    const int kv_heads = static_cast<int>(key.size(1));
+    const int kv_len = static_cast<int>(key.size(2));
+    const int selected_len = static_cast<int>(selected.size(2));
+    const int heads_per_kv = static_cast<int>(query.size(2)) / kv_heads;
+    auto output = torch::empty(query.sizes(), query.options());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+#define QWEN4_EXP_LAUNCH_QSA_SPLITK_ROWS(HEADS)                                        \
+    launch_qsa_splitk_rows<HEADS>(                                                     \
+        query.data_ptr<c10::BFloat16>(),                                          \
+        key.data_ptr<c10::BFloat16>(),                                            \
+        value.data_ptr<c10::BFloat16>(),                                          \
+        selected.data_ptr<int32_t>(),                                             \
+        output.data_ptr<c10::BFloat16>(),                                         \
+        query_rows,                                                               \
+        kv_heads,                                                                 \
+        kv_len,                                                                   \
+        selected_len,                                                             \
+        static_cast<float>(softmax_scale),                                        \
+        stream)
+    switch (heads_per_kv) {
+        case 1: QWEN4_EXP_LAUNCH_QSA_SPLITK_ROWS(1); break;
+        case 2: QWEN4_EXP_LAUNCH_QSA_SPLITK_ROWS(2); break;
+        case 3: QWEN4_EXP_LAUNCH_QSA_SPLITK_ROWS(3); break;
+        case 4: QWEN4_EXP_LAUNCH_QSA_SPLITK_ROWS(4); break;
+        case 5: QWEN4_EXP_LAUNCH_QSA_SPLITK_ROWS(5); break;
+        case 6: QWEN4_EXP_LAUNCH_QSA_SPLITK_ROWS(6); break;
+        case 7: QWEN4_EXP_LAUNCH_QSA_SPLITK_ROWS(7); break;
+        case 8: QWEN4_EXP_LAUNCH_QSA_SPLITK_ROWS(8); break;
+        case 9: QWEN4_EXP_LAUNCH_QSA_SPLITK_ROWS(9); break;
+        case 10: QWEN4_EXP_LAUNCH_QSA_SPLITK_ROWS(10); break;
+        case 11: QWEN4_EXP_LAUNCH_QSA_SPLITK_ROWS(11); break;
+        case 12: QWEN4_EXP_LAUNCH_QSA_SPLITK_ROWS(12); break;
+    }
+#undef QWEN4_EXP_LAUNCH_QSA_SPLITK_ROWS
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }

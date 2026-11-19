@@ -74,6 +74,12 @@ __global__ void gated_delta_bf16_kernel(
     const c10::BFloat16* __restrict__ beta,
     float* __restrict__ state,
     c10::BFloat16* __restrict__ output,
+    // Per-token recurrent state, or nullptr. A speculative verify round runs K positions and may
+    // keep only a prefix of them, so it has to be able to put each linear layer back to the state
+    // after position k. The final state alone cannot express that, and recomputing the recurrence
+    // would cost a replay; dumping it as the scan already passes through it is free when unused.
+    // Layout [token][value_head][row][col] float32, the same inner layout as `state`.
+    float* __restrict__ states_out,
     int rows,
     int key_heads,
     int value_heads,
@@ -219,6 +225,27 @@ __global__ void gated_delta_bf16_kernel(
             attention[col_slot] = subgroup_sum(sum);
         }
 
+        // The shard now holds the state *after* this token. Written here rather than after the
+        // loop because a caller that needs them needs every position, and it is the same value the
+        // final write-back stores, so recording it cannot change the arithmetic.
+        if (states_out != nullptr) {
+            float* dump = states_out +
+                (static_cast<long long>(token) * value_heads + value_head) *
+                    (static_cast<long long>(kDim) * kDim);
+#pragma unroll
+            for (int col_slot = 0; col_slot < kCols; ++col_slot) {
+                const int col = col_base + col_slot;
+                if (col < kDim) {
+#pragma unroll
+                    for (int row_slot = 0; row_slot < kRowsPerLane; ++row_slot) {
+                        const int row = row_slot * kWidth + lane;
+                        dump[static_cast<long long>(row) * kDim + col] =
+                            state_shard[col_slot][row_slot];
+                    }
+                }
+            }
+        }
+
         if (lane == 0) {
             const int64_t base =
                 (static_cast<int64_t>(token) * value_heads + value_head) * kDim;
@@ -257,6 +284,7 @@ void launch_gated_delta(
     const c10::BFloat16* beta,
     float* state,
     c10::BFloat16* output,
+    float* states_out,
     int rows,
     int key_heads,
     int value_heads,
@@ -277,6 +305,7 @@ void launch_gated_delta(
         beta,
         state,
         output,
+        states_out,
         rows,
         key_heads,
         value_heads,
@@ -293,7 +322,8 @@ std::vector<torch::Tensor> qwen4_exp_gated_delta_bf16_forward_cuda(
     const torch::Tensor& beta,
     const torch::Tensor& initial_state,
     double norm_eps,
-    int64_t groups_per_block) {
+    int64_t groups_per_block,
+    const c10::optional<torch::Tensor>& states_out) {
     c10::cuda::CUDAGuard device_guard(query.device());
 
     const int rows = static_cast<int>(query.size(1));
@@ -303,6 +333,11 @@ std::vector<torch::Tensor> qwen4_exp_gated_delta_bf16_forward_cuda(
     auto key_normalized = torch::empty(key.sizes(), key.options().dtype(torch::kFloat32));
     auto output = torch::empty(value.sizes(), value.options());
     auto state = initial_state.clone();
+    // Optional: one state a position, so a speculative verify can rewind to any of them.
+    float* states_ptr = nullptr;
+    if (states_out.has_value()) {
+        states_ptr = states_out->data_ptr<float>();
+    }
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     normalize_qk_bf16_kernel<<<rows * key_heads, 32, 0, stream>>>(
@@ -326,6 +361,7 @@ std::vector<torch::Tensor> qwen4_exp_gated_delta_bf16_forward_cuda(
                 beta.data_ptr<c10::BFloat16>(),
                 state.data_ptr<float>(),
                 output.data_ptr<c10::BFloat16>(),
+                states_ptr,
                 rows,
                 key_heads,
                 value_heads,
@@ -341,6 +377,7 @@ std::vector<torch::Tensor> qwen4_exp_gated_delta_bf16_forward_cuda(
                 beta.data_ptr<c10::BFloat16>(),
                 state.data_ptr<float>(),
                 output.data_ptr<c10::BFloat16>(),
+                states_ptr,
                 rows,
                 key_heads,
                 value_heads,
@@ -356,6 +393,7 @@ std::vector<torch::Tensor> qwen4_exp_gated_delta_bf16_forward_cuda(
                 beta.data_ptr<c10::BFloat16>(),
                 state.data_ptr<float>(),
                 output.data_ptr<c10::BFloat16>(),
+                states_ptr,
                 rows,
                 key_heads,
                 value_heads,
@@ -371,6 +409,7 @@ std::vector<torch::Tensor> qwen4_exp_gated_delta_bf16_forward_cuda(
                 beta.data_ptr<c10::BFloat16>(),
                 state.data_ptr<float>(),
                 output.data_ptr<c10::BFloat16>(),
+                states_ptr,
                 rows,
                 key_heads,
                 value_heads,

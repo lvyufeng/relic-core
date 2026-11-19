@@ -32,6 +32,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/util/BFloat16.h>
 #include <cuda_runtime.h>
+#include <cstdlib>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -222,11 +223,12 @@ __global__ void fp8_gemv_bf16_kernel(
 // Phase 1: the gate and up halves for every intermediate index, into the slot's scratch row.
 // Grid: (slots,) with one block each, so this is one dispatch for the whole top-k.
 __global__ void fp8_expert_act_kernel(
-    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ x,        // [slots, hidden] or one row when x_stride is 0
     const uint8_t* __restrict__ gate_up,        // [E, 2*inter, hidden]
     const __nv_bfloat16* __restrict__ scale,    // [E, ceil(2*inter/128), ceil(hidden/128)]
     __nv_bfloat16* __restrict__ act,            // [slots, inter]
     const int* __restrict__ expert,             // [slots]
+    const long long x_stride,                   // elements between slots in `x`
     int scale_cols,
     int hidden,
     int inter) {
@@ -285,7 +287,10 @@ __global__ void fp8_expert_act_kernel(
             const float us = __bfloat162float(sc[up_scale_row + scale_col]);
 #pragma unroll
             for (int e = 0; e < 16; ++e) {
-                const float xv = __bfloat162float(x[col + e]);
+                // A decode has one token and every slot shares its row; a prefill gives each
+                // (token, expert) pair its own, which is what makes the same kernel a grouped
+                // GEMM -- the grid already walks slots on its own axis.
+                const float xv = __bfloat162float(x[x_stride * slot + col + e]);
                 gate_acc = fmaf(e4m3_to_float_exact(gp[e]) * gs, xv, gate_acc);
                 up_acc = fmaf(e4m3_to_float_exact(up[e]) * us, xv, up_acc);
             }
@@ -604,8 +609,10 @@ torch::Tensor qwen4_exp_fp8_slots_swiglu_cuda(
     // from `down`, which is the row layout either way: [E, hidden, inter].
     TORCH_CHECK(down.dim() == 3 && gate_up.size(0) == down.size(0),
                 "tables must be [E, ...] with the same number of experts");
-    TORCH_CHECK(x.numel() == down.size(1),
-                "x must be as long as an expert's hidden size");
+    // One token, or a row a slot: a decode shares one row across every slot, a prefill gives each
+    // (token, expert) pair its own and the same kernel becomes the grouped GEMM.
+    TORCH_CHECK(x.numel() % down.size(1) == 0 && x.numel() >= down.size(1),
+                "x must be one expert-length row, or a whole number of them");
 
     const at::cuda::CUDAGuard guard(x.device());
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -627,6 +634,21 @@ torch::Tensor qwen4_exp_fp8_slots_swiglu_cuda(
     // The act phase took one block a slot and walked every row with eight warps; it now takes
     // the split the down phase already took, so both phases fill the card.
     const int act_blocks = blocks;
+    // The down phase's split is priced separately from the act phase's, because one number for
+    // both cannot tell which phase a change helped or hurt.
+    //
+    // It was split out on the theory that the down phase is latency-bound at decode -- ten slots,
+    // only ~1.25 of them owned by this rank, so a grid of (4, 10) leaves roughly five CTAs doing
+    // real work on a 128-SM card -- and that more blocks would therefore be faster. Measured on
+    // eight RTX 4090s at 8192 positions, three interleaved rounds an arm, tokens identical
+    // throughout: 4 blocks 45.37 tok/s, 8 blocks 33.05, 16 blocks 39.82. The theory was wrong --
+    // extra blocks cost more in re-reading the activation than they recover in parallelism, and 4
+    // is the optimum. The knob stays because it is the right shape for measuring this, with 4
+    // still the default.
+    int down_blocks = blocks;
+    if (const char* down_env = std::getenv("POCKETLLM_QWEN4_FP8_EXPERT_DOWN_BLOCKS")) {
+        down_blocks = static_cast<int>(std::max<long>(1, std::strtol(down_env, nullptr, 10)));
+    }
 
     auto act = torch::empty({slots, static_cast<int64_t>(inter)}, x.options());
     const auto* x_bf = reinterpret_cast<const __nv_bfloat16*>(x.const_data_ptr());
@@ -641,12 +663,15 @@ torch::Tensor qwen4_exp_fp8_slots_swiglu_cuda(
     auto* out_bf = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
 
     if (getenv("NOPHASE") == nullptr) {
+    // Zero when every slot reads the same row, which is the decode shape.
+    const long long x_stride =
+        static_cast<long long>(hidden) * (x.numel() > static_cast<int64_t>(hidden) ? 1 : 0);
     fp8_expert_act_kernel<<<dim3(static_cast<unsigned>(act_blocks), static_cast<unsigned>(slots)),
                              kExpertThreads, 0, stream>>>(
-        x_bf, gu_t_u8, gu_bf, act_bf, ids, gate_scale_cols, hidden, inter);
+        x_bf, gu_t_u8, gu_bf, act_bf, ids, x_stride, gate_scale_cols, hidden, inter);
     }
     if (getenv("NODOWN") == nullptr) {
-    fp8_expert_down_kernel<<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(slots)),
+    fp8_expert_down_kernel<<<dim3(static_cast<unsigned>(down_blocks), static_cast<unsigned>(slots)),
                              kExpertThreads, 0, stream>>>(
         dw_u8, dw_bf, act_bf, w_bf, ids, out_bf, down_scale_cols, hidden, inter);
     }

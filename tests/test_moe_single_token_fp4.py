@@ -24,12 +24,32 @@ _FP4_LEVELS = torch.tensor(
 )
 
 
-def _e8m0_byte_to_scale(byte_tensor: torch.Tensor) -> torch.Tensor:
-    return torch.exp2((byte_tensor.to(torch.float32) - 127.0))
+def _e4m3_byte_to_scale(byte_tensor: torch.Tensor) -> torch.Tensor:
+    """Decode a scale byte the way `fp4_block_scale` does: E4M3, not E8M0.
+
+    This test used to treat the byte as an e8m0 exponent (`2^(b-127)`). The kernel's
+    `fp4_block_scale` parses sign / 4-bit exponent biased by 7 / 3-bit mantissa, and its own comment
+    records why: a ModelOpt checkpoint stores these scales as F8_E4M3, and the old `2^(b-1)`-style
+    rule turned every product into an overflow. The reference has to decode the same way or it is
+    validating a format the kernel does not implement.
+    """
+    bits = byte_tensor.to(torch.int64)
+    sign = (bits >> 7) & 0x1
+    exponent = (bits >> 3) & 0xF
+    mantissa = bits & 0x7
+    mant = mantissa.to(torch.float32)
+    subnormal = (mant / 8.0) * (2.0 ** -6)
+    normal = (1.0 + mant / 8.0) * torch.pow(2.0, (exponent - 7).to(torch.float32))
+    value = torch.where(exponent == 0, subnormal, normal)
+    return torch.where(sign == 1, -value, value)
 
 
 def _dequant_fp4(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    """packed: [..., K/2] uint8; scales: [..., K/32] uint8 e8m0 bytes -> float32 [..., K]."""
+    """packed: [..., K/2] uint8; scales: [..., K/16] uint8 E4M3 bytes -> float32 [..., K].
+
+    The doubled E2M1 codebook the kernel uses is applied here, so a scale byte of `amax/12`
+    in this reference corresponds to a weight of `level * amax/6` -- see the note below.
+    """
     raw = packed.contiguous().to(torch.uint8)
     *batch, k_half = raw.shape
     low = raw & 0x0F
@@ -38,10 +58,15 @@ def _dequant_fp4(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     codes = torch.empty(*batch, k_half * 2, dtype=torch.uint8, device=raw.device)
     codes[..., 0::2] = low
     codes[..., 1::2] = high
-    levels = _FP4_LEVELS.to(raw.device)
+    # `fp4_lut_x2` is the LUT the kernel's DP4A path uses and it stores the E2M1 levels **doubled**
+    # ({0,1,2,3,4,6,8,12}), so a kernel-correct reference has to double them too. The half that
+    # compensates belongs to whoever produces the scale bytes: a caller that wants a weight of
+    # `level * amax/6` passes an E4M3 block scale of `amax/12`.
+    levels = _FP4_LEVELS.to(raw.device) * 2.0
     weights = levels[codes.long()]
-    # Scales: one byte per 32 K elems.
-    block_scales = _e8m0_byte_to_scale(scales).repeat_interleave(32, dim=-1)
+    # Scales: one byte per 16 K elems, which is the ModelOpt grouping the kernel implements
+    # (`blocks_k = dim / 16`). This used to say 32 and the kernel refuses that shape outright.
+    block_scales = _e4m3_byte_to_scale(scales).repeat_interleave(16, dim=-1)
     return weights * block_scales
 
 
@@ -93,8 +118,9 @@ def _make_random_fp4(n_experts: int, out_dim: int, in_dim: int, seed: int, devic
     g = torch.Generator(device=device).manual_seed(seed)
     # Random FP4 codes 0..15 (each byte = two codes).
     packed = torch.randint(0, 256, (n_experts, out_dim, in_dim // 2), generator=g, device=device, dtype=torch.uint8)
-    # Random e8m0 scale bytes around 127 (so scale ~1.0). Range 124..130 -> scale 2^-3..2^3.
-    scales = torch.randint(124, 131, (n_experts, out_dim, in_dim // 32), generator=g, device=device, dtype=torch.uint8)
+    # Random E4M3 scale bytes around 1.0: 0x30..0x40 decode to 0.5..2.0 under sign/exp/exp bias 7
+    # and mantissa. Staying away from 0x7F matters because that byte is NaN in E4M3.
+    scales = torch.randint(0x30, 0x41, (n_experts, out_dim, in_dim // 16), generator=g, device=device, dtype=torch.uint8)
     return packed, scales
 
 
