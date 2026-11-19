@@ -55,7 +55,7 @@ file is live; the third is what says whether that file is the revision you think
 
 ```bash
 # 1. which file the loader resolves, under the interpreter that will run the model
-/home/lvyufeng/miniconda3/envs/deepseek/bin/python -c "
+/home/<user>/miniconda3/envs/deepseek/bin/python -c "
 from src.kernels.cuda_loader import load_cuda_kernel
 print(load_cuda_kernel())"
 
@@ -65,7 +65,7 @@ md5sum build/extensions/cuda_kernel.cpython-311-x86_64-linux-gnu.so \
 ls -l --time-style=long-iso src/csrc/*.cu src/csrc/*.cpp
 
 # 3. the op the run actually needs -- the only check that sees a stale build
-/home/lvyufeng/miniconda3/envs/deepseek/bin/python -c "
+/home/<user>/miniconda3/envs/deepseek/bin/python -c "
 from src.kernels.cuda_loader import load_cuda_kernel
 m = load_cuda_kernel()
 print(len([n for n in dir(m) if not n.startswith('_')]), 'bindings')
@@ -78,7 +78,7 @@ copied before that failure, so read the timestamp on the `.so` rather than the e
 
 ```bash
 PATH=/usr/local/cuda-12.4/bin:$PATH CUDA_HOME=/usr/local/cuda-12.4 TORCH_CUDA_ARCH_LIST=7.5 \
-  /home/lvyufeng/miniconda3/envs/deepseek/bin/python setup.py build_ext --inplace
+  /home/<user>/miniconda3/envs/deepseek/bin/python setup.py build_ext --inplace
 ```
 
 ## What is compiled is `setup.py`'s list, not the directory
