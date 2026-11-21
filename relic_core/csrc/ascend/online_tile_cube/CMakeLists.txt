@@ -27,6 +27,14 @@ set(RELIC_TILE_PREPARED_TABLES 0 CACHE STRING "Copy immutable decode lookup/inde
 if(NOT RELIC_TILE_PREPARED_TABLES MATCHES "^(0|1)$")
     message(FATAL_ERROR "RELIC_TILE_PREPARED_TABLES must be an explicit 0 or 1")
 endif()
+set(RELIC_TILE_CUBE_PACKED 0 CACHE STRING "Consume explicit offline Cube-order compact FP4 banks")
+if(NOT RELIC_TILE_CUBE_PACKED MATCHES "^(0|1)$")
+    message(FATAL_ERROR "RELIC_TILE_CUBE_PACKED must be an explicit 0 or 1")
+endif()
+set(RELIC_TILE_UNSIGNED_BYTE_CAST 0 CACHE STRING "Use exact A2 uint8-to-half byte indices")
+if(NOT RELIC_TILE_UNSIGNED_BYTE_CAST MATCHES "^(0|1)$")
+    message(FATAL_ERROR "RELIC_TILE_UNSIGNED_BYTE_CAST must be an explicit 0 or 1")
+endif()
 # One generated source entry embeds the geometry before including the kernel.
 # Both the host workspace query and the device compiler see the same literal.
 configure_file(kernel_entry.cpp.in ${CMAKE_CURRENT_BINARY_DIR}/online_tile_cube_entry.cpp @ONLY)

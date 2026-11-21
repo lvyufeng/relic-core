@@ -35,6 +35,20 @@ static_assert(DIRECT_BITS <= 1, "direct BF16 bit decoding is an explicit build-t
 #endif
 constexpr uint32_t PREPARED_TABLES = RELIC_TILE_PREPARED_TABLES;
 static_assert(PREPARED_TABLES <= 1, "immutable decode tables require an explicit build-time opt-in");
+#ifndef RELIC_TILE_CUBE_PACKED
+#define RELIC_TILE_CUBE_PACKED 0
+#endif
+constexpr uint32_t CUBE_PACKED = RELIC_TILE_CUBE_PACKED;
+static_assert(CUBE_PACKED <= 1, "offline compact layout is an explicit build-time experiment");
+static_assert(CUBE_PACKED == 0 || (N == 32 && GROUP_K == 4 && DIRECT_BITS == 0 && PREPARED_TABLES == 1),
+              "offline Cube-order FP4 requires the checked prepared N32/K128 floating decoder");
+#ifndef RELIC_TILE_UNSIGNED_BYTE_CAST
+#define RELIC_TILE_UNSIGNED_BYTE_CAST 0
+#endif
+constexpr uint32_t UNSIGNED_BYTE_CAST = RELIC_TILE_UNSIGNED_BYTE_CAST;
+static_assert(UNSIGNED_BYTE_CAST <= 1, "unsigned byte indices are an explicit A2 experiment");
+static_assert(UNSIGNED_BYTE_CAST == 0 || (PREPARED_TABLES == 1 && DIRECT_BITS == 0),
+              "unsigned byte casts require the checked prepared floating decoder");
 constexpr uint32_t L1_BYTES = 512 * 1024;
 constexpr uint32_t K_BLOCK = 32;
 constexpr uint32_t K = K_BLOCK * GROUP_K;
@@ -49,7 +63,7 @@ constexpr uint32_t TABLE_REPEAT_COUNT = DIRECT_BITS ? BYTES : ELEMENTS;
 constexpr uint32_t TABLE_NZ = TABLE_REPEAT + TABLE_REPEAT_COUNT;
 constexpr uint32_t TABLE_MASK = TABLE_NZ + BYTES;
 constexpr uint32_t TABLE_POISON = TABLE_MASK + 256;
-constexpr uint32_t TABLE_WORDS = TABLE_MASK + (DIRECT_BITS ? 512 : 0);
+constexpr uint32_t TABLE_WORDS = (CUBE_PACKED ? TABLE_NZ : TABLE_MASK) + (DIRECT_BITS ? 512 : 0);
 constexpr uint32_t L1_B_SLOT_BYTES = ELEMENTS * sizeof(bfloat16_t);
 constexpr uint32_t L1_A_OFFSET = 2 * L1_B_SLOT_BYTES;
 constexpr uint32_t SCALE_PAD = (SCALE_COUNT + 31) / 32 * 32;
@@ -107,7 +121,7 @@ public:
         lookup_ = LocalTensor<uint32_t>(TPosition::VECCALC, LOOKUP_OFFSET, 256);
         unitPairs_ = LocalTensor<uint32_t>(TPosition::VECCALC, PAIRS_OFFSET, BYTES);
         values_ = LocalTensor<float>(TPosition::VECCALC, VALUES_OFFSET, ELEMENTS);
-        scaled_ = LocalTensor<bfloat16_t>(TPosition::VECCALC, SCALED_OFFSET, ELEMENTS);
+        scaled_ = LocalTensor<bfloat16_t>(TPosition::VECCALC, SCALED_OFFSET, CUBE_PACKED ? 2 * ELEMENTS : ELEMENTS);
         nzIndexes_ = LocalTensor<uint32_t>(TPosition::VECCALC, NZ_OFFSET, BYTES);
         scaleHalf_ = LocalTensor<half>(TPosition::VECCALC, SCALE_HALF_OFFSET, SCALE_COUNT);
         scaleIndexes_ = LocalTensor<int32_t>(TPosition::VECCALC, SCALE_INDEX_OFFSET, SCALE_COUNT);
@@ -131,7 +145,7 @@ public:
                 DataCopy(lookup_, tables_, 256);
                 DataCopy(scaleLookup_, tables_[TABLE_SCALE], 256);
                 DataCopy(repeatScaleIndexes_, tables_[TABLE_REPEAT], TABLE_REPEAT_COUNT);
-                DataCopy(nzIndexes_, tables_[TABLE_NZ], BYTES);
+                if constexpr (CUBE_PACKED == 0) DataCopy(nzIndexes_, tables_[TABLE_NZ], BYTES);
                 if constexpr (DIRECT_BITS != 0) {
                     DataCopy(bitMaskLookup_, tables_[TABLE_MASK], 256);
                     DataCopy(bitPoisonLookup_, tables_[TABLE_POISON], 256);
@@ -145,7 +159,9 @@ public:
         // Retain the legacy ABI and default path when no prepared pointer is
         // supplied. The opt-in launch skips every scalar table-fill loop.
         for (uint32_t index = 0; index < (DIRECT_BITS ? BYTES : ELEMENTS); ++index) {
-            repeatScaleIndexes_.SetValue(index, (index / (DIRECT_BITS ? K_BLOCK / 2 : K_BLOCK)) * sizeof(uint32_t));
+            const uint32_t scaleIndex = CUBE_PACKED ? (index / (N * K_BLOCK)) * N + (index / 16) % N
+                : index / (DIRECT_BITS ? K_BLOCK / 2 : K_BLOCK);
+            repeatScaleIndexes_.SetValue(index, scaleIndex * sizeof(uint32_t));
         }
         for (uint32_t index = 0; index < BYTES; ++index) {
             const uint32_t halfTile = index / (N * 8);
@@ -159,7 +175,7 @@ public:
                                        + row * 16 + half * 8 + pair) * sizeof(uint32_t));
         }
         for (uint32_t index = 0; index < 256; ++index) {
-            const uint8_t byte = (index + 128) & 255;
+            const uint8_t byte = (index + (UNSIGNED_BYTE_CAST ? 0 : 128)) & 255;
             if constexpr (DIRECT_BITS != 0) {
                 const uint16_t offset = static_cast<uint16_t>((static_cast<int32_t>(byte) - 127) * 128);
                 scaleLookup_.SetValue(index, byte >= 2 && byte <= 252
@@ -200,9 +216,17 @@ public:
             }
             const uint32_t local = expert / world_;
             const uint64_t base = (static_cast<uint64_t>(local) * sourceTiles_ + tile * N_TILES) * blocks_;
+            const uint64_t compactBase = (static_cast<uint64_t>(local) * tiles_ + tile) * blocks_;
             for (uint32_t block = 0; block < blocks_; ++block) {
                 const uint32_t slot = block & 1;
                 if (block >= 2) CrossCoreWaitFlag<0x2>(FREE_FLAG + slot);
+                if constexpr (CUBE_PACKED != 0) {
+                    // Offline layout already matches Mmad K16-major/N16-minor B.
+                    // Scales stay one original byte per N row and K32 block.
+                    const uint64_t source = compactBase + block;
+                    DataCopy(raw_, packed_[source * BYTES], BYTES);
+                    DataCopy(scale_, scales_[source * SCALE_COUNT], SCALE_COUNT);
+                } else {
                 // Wider output tiles read adjacent original N16 banks without
                 // repacking or changing a single checkpoint code/scale byte.
                 for (uint32_t sourceTile = 0; sourceTile < N_TILES; ++sourceTile) {
@@ -212,16 +236,23 @@ public:
                                 DataCopyExtParams{1, SOURCE_SCALES, 0, 0, 0},
                                 DataCopyPadExtParams<uint8_t>{false, 0, 0, 0});
                 }
+                }
                 SetFlag<HardEvent::MTE2_S>(0);
                 WaitFlag<HardEvent::MTE2_S>(0);
                 SetFlag<HardEvent::MTE2_V>(0);
                 WaitFlag<HardEvent::MTE2_V>(0);
-                Cast(signedHalf_, raw_.ReinterpretCast<int8_t>(), RoundMode::CAST_NONE, BYTES);
+                if constexpr (UNSIGNED_BYTE_CAST != 0) {
+                    Cast(signedHalf_, raw_, RoundMode::CAST_NONE, BYTES);
+                } else {
+                    Cast(signedHalf_, raw_.ReinterpretCast<int8_t>(), RoundMode::CAST_NONE, BYTES);
+                }
                 PipeBarrier<PIPE_V>();
                 Cast(indexes_, signedHalf_, RoundMode::CAST_RINT, BYTES);
                 PipeBarrier<PIPE_V>();
-                Adds(indexes_, indexes_, static_cast<int32_t>(128), BYTES);
-                PipeBarrier<PIPE_V>();
+                if constexpr (UNSIGNED_BYTE_CAST == 0) {
+                    Adds(indexes_, indexes_, static_cast<int32_t>(128), BYTES);
+                    PipeBarrier<PIPE_V>();
+                }
                 ShiftLeft(indexes_.ReinterpretCast<uint32_t>(), indexes_.ReinterpretCast<uint32_t>(),
                           static_cast<uint32_t>(2), BYTES);
                 PipeBarrier<PIPE_V>();
@@ -232,12 +263,18 @@ public:
                 } else {
                 Cast(values_, unitPairs_.ReinterpretCast<bfloat16_t>(), RoundMode::CAST_NONE, ELEMENTS);
                 PipeBarrier<PIPE_V>();
-                Cast(scaleHalf_, scale_.ReinterpretCast<int8_t>(), RoundMode::CAST_NONE, SCALE_COUNT);
+                if constexpr (UNSIGNED_BYTE_CAST != 0) {
+                    Cast(scaleHalf_, scale_, RoundMode::CAST_NONE, SCALE_COUNT);
+                } else {
+                    Cast(scaleHalf_, scale_.ReinterpretCast<int8_t>(), RoundMode::CAST_NONE, SCALE_COUNT);
+                }
                 PipeBarrier<PIPE_V>();
                 Cast(scaleIndexes_, scaleHalf_, RoundMode::CAST_RINT, SCALE_COUNT);
                 PipeBarrier<PIPE_V>();
-                Adds(scaleIndexes_, scaleIndexes_, static_cast<int32_t>(128), SCALE_COUNT);
-                PipeBarrier<PIPE_V>();
+                if constexpr (UNSIGNED_BYTE_CAST == 0) {
+                    Adds(scaleIndexes_, scaleIndexes_, static_cast<int32_t>(128), SCALE_COUNT);
+                    PipeBarrier<PIPE_V>();
+                }
                 ShiftLeft(scaleIndexes_.ReinterpretCast<uint32_t>(), scaleIndexes_.ReinterpretCast<uint32_t>(),
                           static_cast<uint32_t>(2), SCALE_COUNT);
                 PipeBarrier<PIPE_V>();
@@ -248,16 +285,25 @@ public:
                 PipeBarrier<PIPE_V>();
                 Mul(values_, values_, expandedFactors_, ELEMENTS);
                 PipeBarrier<PIPE_V>();
-                Cast(scaled_, values_, RoundMode::CAST_RINT, ELEMENTS);
+                const auto scaledTile = scaled_[CUBE_PACKED ? slot * ELEMENTS : 0];
+                Cast(scaledTile, values_, RoundMode::CAST_RINT, ELEMENTS);
                 PipeBarrier<PIPE_V>();
                 }
+                if constexpr (CUBE_PACKED != 0) {
+                    SetFlag<HardEvent::V_MTE3>(0);
+                    WaitFlag<HardEvent::V_MTE3>(0);
+                    DataCopy(stage_[owner * 2 * ELEMENTS + slot * ELEMENTS], scaled_[slot * ELEMENTS], ELEMENTS);
+                } else {
                 Gather(decoded_[slot * ELEMENTS].ReinterpretCast<uint32_t>(),
                        scaled_.ReinterpretCast<uint32_t>(), nzIndexes_, static_cast<uint32_t>(0), BYTES);
                 SetFlag<HardEvent::V_MTE3>(0);
                 WaitFlag<HardEvent::V_MTE3>(0);
                 DataCopy(stage_[owner * 2 * ELEMENTS + slot * ELEMENTS],
                          decoded_[slot * ELEMENTS].ReinterpretCast<bfloat16_t>(), ELEMENTS);
+                }
                 CrossCoreSetFlag<0x2, PIPE_MTE3>(READY_FLAG + slot);
+                // The compact scaled BF16 uses two UB slots in the unused NZ
+                // index space. FREE fences both UB and GM reuse after two blocks.
                 // The single raw/scale UB slot cannot be overwritten until
                 // the current vector decode has consumed it.
                 SetFlag<HardEvent::V_MTE2>(0);
@@ -466,6 +512,16 @@ extern "C" __global__ __aicore__ void relic_online_tile_cube(
         cube.Init(x, selected, out, stage, tiles, blocks, world, n, shared != 0, groups);
         cube.Process(groups, owned);
     }
+}
+
+extern "C" uint32_t relic_online_tile_cube_unsigned_byte_cast()
+{
+    return UNSIGNED_BYTE_CAST;
+}
+
+extern "C" uint32_t relic_online_tile_cube_compact_layout()
+{
+    return CUBE_PACKED;
 }
 
 extern "C" uint32_t relic_online_tile_cube_output_rows()
