@@ -26,6 +26,17 @@ there is no JIT fallback to catch a mismatch -- a build for the wrong arch impor
 fine (the loader only ``exec_module``s) and dies at its first kernel launch with
 "no kernel image is available for execution on the device".  One fatbin holding all
 of them is what lets ``cuda_loader`` stay arch-blind and keep loading by bare name.
+
+``RELIC_CORE_BUILD_EXTENSIONS=0`` installs the Python package alone.  The switch is
+for hosts that have a torch (possibly with a non-CUDA accelerator) but no CUDA
+toolkit at all: there, merely constructing ``CUDAExtension`` raises
+``CUDA_HOME environment variable is not set`` before any source is compiled, so the
+Python modules cannot be installed either.  The default is ``1``, and only ``0`` or
+``1`` is accepted -- deciding silently between "with" and "without" kernels is how a
+package ends up installed and looking complete while its extensions are missing.  A
+Python-only install produces none of the three extensions; ``cuda_loader`` then
+returns ``None`` for them, which is the same degradation as any missing build, and
+the callers that require them fail at their first use rather than at import.
 """
 
 import os
@@ -39,6 +50,30 @@ from setuptools import Extension
 
 ROOT = Path(__file__).resolve().parent
 EXTENSIONS_DIR = ROOT / "build" / "extensions"
+
+#: Build the three native extensions.  Only the explicit values ``0`` and ``1`` are
+#: accepted: an unset variable means the historical build, and a typo must not be
+#: read as "off".
+BUILD_EXTENSIONS_ENV = "RELIC_CORE_BUILD_EXTENSIONS"
+
+
+def _build_extensions_enabled() -> bool:
+    """Whether this build instantiates and compiles the native extensions.
+
+    Read once, at setup time.  ``0`` is the Python-only install described in the
+    module docstring; it is explicit because a package that quietly ships without
+    its kernels is indistinguishable from one that works until a kernel is called.
+    """
+    raw = os.environ.get(BUILD_EXTENSIONS_ENV, "1")
+    if raw not in {"0", "1"}:
+        raise RuntimeError(
+            f"{BUILD_EXTENSIONS_ENV} must be '0' or '1', got {raw!r}; leave it unset or set "
+            "'1' to build the native extensions, or set '0' for a Python-only install"
+        )
+    return raw == "1"
+
+
+BUILD_EXTENSIONS = _build_extensions_enabled()
 
 # Pin the arch rather than inheriting whatever the box has. A build that silently
 # targets sm_80+ produces a library that cannot load on the 2080 Ti it exists for;
@@ -76,6 +111,10 @@ class BuildExtensions(BuildExtension):
             shutil.copy2(module, EXTENSIONS_DIR / module.name)
 
 
+# A Python-only build describes no extension at all: constructing CUDAExtension is
+# the failure that mode exists to avoid (no CUDA_HOME), so the list literal below
+# is not evaluated when the switch is 0.  There is no build_ext command either --
+# with nothing to compile or stage, registering one would only suggest otherwise.
 ext_modules = [
     CUDAExtension(
         name="cuda_kernel",
@@ -120,10 +159,11 @@ ext_modules = [
             "nvcc": ["-O3", "--use_fast_math", "-lineinfo"],
         },
     ),
-]
+] if BUILD_EXTENSIONS else []
+cmdclass = {"build_ext": BuildExtensions} if BUILD_EXTENSIONS else {}
 
 setup(
     packages=find_packages(include=["relic_core", "relic_core.*"]),
     ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildExtensions},
+    cmdclass=cmdclass,
 )
