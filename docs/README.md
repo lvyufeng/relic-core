@@ -22,6 +22,9 @@ engine. Five pages came across; that is not a truncation, it is the boundary doi
 | [Ternary-Bonsai-2-27B dense GEMM](architecture/ternary_bonsai_2_dense_gemm.md) | The ternary-weight dense GEMM path on sm_75 — block format, Hadamard fold, and why the kernel is shaped the way it is. |
 | [CUDA extension builds](guides/cuda_extension_builds.md) | Building and loading the extensions: the two flags that matter, the `CUDA_HOME` mismatch trap, and the microbenchmark harness. |
 | [Ascend SoC generations](guides/ascend_soc_generations.md) | `910B` against `910B1`–`910B4`: how to read the SoC generation off the machine rather than the card's printed name, and why the two need separate kernels. |
+| [Online floating-weight unpack](guides/online_float_unpack.md) | Original E4M3/E8M0-to-BF16 and exact E2M1-to-INT8 widening, encoding edge cases, optional fused Ascend execution and independent correctness tests. |
+| [Original-format block-32 GEMM](guides/original_block_gemm.md) | Original FP8 activation quantization, exact widened FP4 operands, explicit two-half reduction and bounded NPU/CPU operator contracts. |
+| [Python-only installation](guides/python_only_install.md) | Install the operator package without constructing CUDA or x86 host extensions; keep native kernels and availability claims separate. |
 | [DeepSeek-V4.1-Flash MoE weight staging](performance/deepseek_v4_1_flash_moe_weight_staging.md) | The staging path that feeds the routed experts — what is copied, where it waits, and what it costs. |
 | [DeepSeek-V4.1-Flash MoE reduction](performance/deepseek_v4_1_flash_moe_reduce_csr.md) | The expert-output reduction: CSR layout, the fixed-order reduction that replaced `atomicAdd`, and its cost. |
 

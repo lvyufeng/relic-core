@@ -95,6 +95,9 @@ nav:
   - Guides:
       - CUDA extension builds: guides/cuda_extension_builds.md
       - Ascend SoC generations: guides/ascend_soc_generations.md
+      - Online floating-weight unpack: guides/online_float_unpack.md
+      - Original-format block-32 GEMM: guides/original_block_gemm.md
+      - Python-only operator installation: guides/python_only_install.md
   - Performance:
       - DeepSeek-V4.1-Flash MoE weight staging: performance/deepseek_v4_1_flash_moe_weight_staging.md
       - DeepSeek-V4.1-Flash MoE reduction: performance/deepseek_v4_1_flash_moe_reduce_csr.md

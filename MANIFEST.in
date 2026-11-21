@@ -4,6 +4,8 @@ include requirements.txt
 
 # Extension sources, needed for an sdist to rebuild ext_modules.
 recursive-include relic_core/csrc *.cpp *.cu *.cuh *.h *.hpp
+# The separately built, opt-in AscendC consumer needs its CMake source entry.
+recursive-include relic_core/csrc CMakeLists.txt *.in *.md
 recursive-include relic_core/kernels *.py
 
 # Build trees are environment-specific and are already git-ignored.

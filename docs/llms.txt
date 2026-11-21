@@ -18,6 +18,9 @@ by `scripts/gen_llms_txt.py`; edit the nav, not this file, and re-run the script
 
 - [CUDA extension builds](https://lvyufeng.github.io/relic-core/guides/cuda_extension_builds/)
 - [Ascend SoC generations](https://lvyufeng.github.io/relic-core/guides/ascend_soc_generations/)
+- [Online floating-weight unpack](https://lvyufeng.github.io/relic-core/guides/online_float_unpack/)
+- [Original-format block-32 GEMM](https://lvyufeng.github.io/relic-core/guides/original_block_gemm/)
+- [Python-only operator installation](https://lvyufeng.github.io/relic-core/guides/python_only_install/)
 
 ## Performance
 

@@ -12,3 +12,7 @@ dist/
 
 # The documentation site's build output (mkdocs.yml -> .github/workflows/pages.yml).
 /site
+
+# Private coordination scripts, benchmark caches and transferred run artifacts.
+# Publish reproducible evidence separately; never commit this working scratch.
+.coord/
