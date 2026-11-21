@@ -171,3 +171,55 @@ The failed first N32 L0B ordering, corrected independent build, slower direct-bi
 controls and unsuccessful HC/one-collective experiments remain in the runtime's frozen evidence.
 No previous accepted library is overwritten. The consumer stays an explicit numerical/performance
 experiment, and production defaults and serving guards remain unchanged.
+
+## Lossless Cube-order packed format
+
+The optional `relic.fp4.cube-n32-k128.v1` format moves the post-decode weight NZ permutation to
+load time. `relic_core.kernels.cube_packed_format.convert_fp4_cube` maps original CPU code bytes
+`[N,K/2]` to `[N/32,K/128,8,2,16,8]` and original K32 scale bytes `[N,K/32]` to
+`[N/32,K/128,4,32]`. Its inverse recovers every original byte, including signed-zero encodings.
+The format requires `N % 32 == 0` and `K % 128 == 0`; it introduces no padding, new rounding,
+requantization or whole expanded-weight bank. Payload remains exactly `NK/2 + NK/32` bytes.
+
+Build it in a fresh private directory with:
+
+```bash
+cmake -S relic_core/csrc/ascend/online_tile_cube -B /private/build/compact-tile-cube \
+  -DASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/cann-9.2.0 \
+  -DSOC_VERSION=Ascend910B3 -DRUN_MODE=npu -DCMAKE_BUILD_TYPE=Release \
+  -DRELIC_TILE_K_BLOCKS=4 -DRELIC_TILE_OUTPUT_ROWS=32 \
+  -DRELIC_TILE_PREPARED_TABLES=1 -DRELIC_TILE_CUBE_PACKED=1 \
+  -DRELIC_TILE_UNSIGNED_BYTE_CAST=1
+cmake --build /private/build/compact-tile-cube --parallel 2
+```
+
+Both new switches default to zero. Compact order requires the prepared floating N32/K128 decoder;
+unsigned indices require prepared tables and reject the direct-bit decoder. Optional library
+queries preserve the old ABI and report `consumer.weight_format` explicitly. A caller must not
+feed an original N16 bank to the compact consumer, or a compact bank to the original consumer,
+just because their byte counts agree. RelicLLM's opt-in expert TP binding enforces this handshake
+before bank release. The native binding consumes same-size contiguous compatibility views;
+their shape is not proof of their physical encoding.
+
+The compact stream removes the hot NZ weight `Gather` and its immutable table tail, reducing
+metadata from 26,624 to 18,432 bytes/device. The exact A2 `uint8→half→int32` indexing chain removes
+signed-byte `+128` correction barriers. Two compact BF16 UB slots reuse the otherwise dead NZ
+index region; existing READY/FREE fences retire each MTE3 read before slot reuse. The bounded
+393,216-byte GM ring remains, with no new UB allocation or direct A5 transfer assumption.
+
+Independent server gates compare 516,096 decoded BF16 values, 96 changing-input/route graph
+replays, invalid-source/scale poisoning and actual original-checkpoint W1/W3/W2 projections:
+zero differing BF16 outputs or FP32 accumulator bits. Targeted core tests passed 175 cases with
+one CUDA-only skip; these are not a full-suite claim. No tests or native builds ran on macOS.
+
+The linked runtime experiment measured **7.858085→8.581304 TPS (1.092035x)** over 64 synchronized
+batch-one forwards, context 24→88, four warmups excluded. It is a fixed-length autoregressive
+benchmark that continues after EOS, not a normal EOS-terminated completion. All eight ranks'
+reference/teacher/final FP32 tensors match between the two same-provider runs, with the same
+64 benchmark output IDs. A 16-step compact repeat measured 8.609725 TPS. Expert payload stays
+36,097,228,800 bytes/card. Native accumulation still differs from the exact default; no full
+converted checkpoint, prefill performance, general-quality or 50-TPS acceptance is claimed.
+
+The [runtime record](https://github.com/lvyufeng/RelicLLM/blob/a6f56248c5519a51e344354583df8e2caa23eaf9/docs/performance/ascend_compact_weight_format.md)
+retains the paired measurements and original/published artifact identities. Use the companion
+runtime change only with this core format support; neither package changes its production default.

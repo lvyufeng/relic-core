@@ -33,22 +33,26 @@ def activation_l1_layout(k, slots, *, group_k=4, shared=True, output_rows=16):
             "admission_is_geometry_not_measured_occupancy": True}
 
 
-def _decode_table_words(group_k, direct_bits, output_rows=16):
+def _decode_table_words(group_k, direct_bits, output_rows=16, cube_packed=False):
     if (isinstance(group_k, bool) or not isinstance(group_k, int) or group_k not in (1, 2, 4, 8)
             or not isinstance(direct_bits, bool) or isinstance(output_rows, bool)
             or not isinstance(output_rows, int) or output_rows not in (16, 32) or output_rows * group_k > 128):
         raise ValueError("decode tables require bounded original-K32 geometry and an explicit bit policy")
+    if not isinstance(cube_packed, bool) or (cube_packed and (group_k, output_rows, direct_bits) != (4, 32, False)):
+        raise ValueError("offline Cube-order tables require the explicit N32/K128 floating decoder")
     pairs, elements = output_rows * 16 * group_k, output_rows * 32 * group_k
-    return 512 + (pairs if direct_bits else elements) + pairs + (512 if direct_bits else 0)
+    return 512 + (pairs if direct_bits else elements) + (0 if cube_packed else pairs) + (512 if direct_bits else 0)
 
 
-def _decode_table_cpu(group_k, direct_bits, output_rows=16):
+def _decode_table_cpu(group_k, direct_bits, output_rows=16, cube_packed=False, unsigned_byte_cast=False):
     """Exact small metadata only; no checkpoint weight or routing values are read."""
-    words = _decode_table_words(group_k, direct_bits, output_rows)
+    if not isinstance(unsigned_byte_cast, bool) or (unsigned_byte_cast and direct_bits):
+        raise ValueError("unsigned byte tables require the explicit floating decoder")
+    words = _decode_table_words(group_k, direct_bits, output_rows, cube_packed)
     pairs, elements = output_rows * 16 * group_k, output_rows * 32 * group_k
     units = (0, 0x3f00, 0x3f80, 0x3fc0, 0x4000, 0x4040, 0x4080, 0x40c0,
              0, 0xbf00, 0xbf80, 0xbfc0, 0xc000, 0xc040, 0xc080, 0xc0c0)
-    byte_order = [(index + 128) & 255 for index in range(256)]
+    byte_order = [(index + (0 if unsigned_byte_cast else 128)) & 255 for index in range(256)]
     lookup = [units[byte & 15] | (units[byte >> 4] << 16) for byte in byte_order]
     scale_lookup = []
     for byte in byte_order:
@@ -57,7 +61,9 @@ def _decode_table_cpu(group_k, direct_bits, output_rows=16):
             scale_lookup.append((offset | (offset << 16)) if 2 <= byte <= 252 else 0)
         else:
             scale_lookup.append((byte << 23) if 2 <= byte <= 252 else 0x7fc00000)
-    repeat = [index // (16 if direct_bits else 32) * 4 for index in range(pairs if direct_bits else elements)]
+    repeat = [((index // (output_rows * 32)) * output_rows + (index // 16) % output_rows) * 4 if cube_packed
+              else index // (16 if direct_bits else 32) * 4
+              for index in range(pairs if direct_bits else elements)]
     nz = []
     for index in range(pairs):
         half_tile, within = divmod(index, output_rows * 8)
@@ -65,7 +71,7 @@ def _decode_table_cpu(group_k, direct_bits, output_rows=16):
         source_tile, row = divmod(source_row, 16)
         nz.append((source_tile * group_k * 256 + half_tile // 2 * 256
                    + row * 16 + half_tile % 2 * 8 + pair) * 4)
-    payload = lookup + scale_lookup + repeat + nz
+    payload = lookup + scale_lookup + repeat + ([] if cube_packed else nz)
     if direct_bits:
         payload += [(0xffff if byte & 7 else 0) | (0xffff0000 if byte & 0x70 else 0) for byte in byte_order]
         payload += [0 if 2 <= byte <= 252 else 0x7fc07fc0 for byte in byte_order]
@@ -115,6 +121,25 @@ class AscendCTileCubeConsumer:
             self.output_rows = rows_query()
         if self.output_rows not in (16, 32) or self.output_rows * self.group_k > 128:
             raise ValueError("native output-row geometry must fit the bounded original N16/N32 consumer")
+        self.cube_packed = False
+        compact_query = getattr(self._library, "relic_online_tile_cube_compact_layout", None)
+        if compact_query is not None:
+            compact_query.restype, compact_query.argtypes = ctypes.c_uint32, []
+            compact = compact_query()
+            if compact not in (0, 1):
+                raise ValueError("native compact layout must be an explicit boolean")
+            self.cube_packed = bool(compact)
+        self.weight_format = "relic.fp4.cube-n32-k128.v1" if self.cube_packed else "original-n16"
+        if self.cube_packed and (self.group_k, self.output_rows, self.direct_bf16_bits) != (4, 32, False):
+            raise ValueError("offline compact layout requires the checked N32/K128 floating ABI")
+        self.unsigned_byte_cast = False
+        unsigned_query = getattr(self._library, "relic_online_tile_cube_unsigned_byte_cast", None)
+        if unsigned_query is not None:
+            unsigned_query.restype, unsigned_query.argtypes = ctypes.c_uint32, []
+            unsigned = unsigned_query()
+            if unsigned not in (0, 1) or (unsigned and self.direct_bf16_bits):
+                raise ValueError("native unsigned byte casts require an explicit floating policy")
+            self.unsigned_byte_cast = bool(unsigned)
         self.ring_elements = self.output_rows * 32 * self.group_k
         self._launch = self._library.relic_online_tile_cube_launch
         self._launch.restype = None
@@ -134,6 +159,8 @@ class AscendCTileCubeConsumer:
             if prepared not in (0, 1):
                 raise ValueError("native prepared-table policy must be an explicit boolean")
             self.prepared_decode_tables = bool(prepared)
+        if self.unsigned_byte_cast and not self.prepared_decode_tables:
+            raise ValueError("unsigned byte casts require their immutable prepared tables")
         if self.prepared_decode_tables:
             words_query = getattr(self._library, "relic_online_tile_cube_table_words", None)
             self._launch_tables = getattr(self._library, "relic_online_tile_cube_launch_tables", None)
@@ -141,7 +168,7 @@ class AscendCTileCubeConsumer:
                 raise ValueError("native prepared tables require the complete checked table-launch ABI")
             words_query.restype, words_query.argtypes = ctypes.c_uint32, []
             self.table_words = words_query()
-            if self.table_words != _decode_table_words(self.group_k, self.direct_bf16_bits, self.output_rows):
+            if self.table_words != _decode_table_words(self.group_k, self.direct_bf16_bits, self.output_rows, self.cube_packed):
                 raise ValueError("native immutable decode table extent differs from the expected ABI")
             self._launch_tables.restype = None
             self._launch_tables.argtypes = [ctypes.c_uint32, ctypes.c_void_p,
@@ -172,7 +199,7 @@ class AscendCTileCubeConsumer:
             if capturing is not None and capturing():
                 raise RuntimeError("prepare native decode metadata before entering NPU graph capture")
             if self._cpu_decode_table is None:
-                self._cpu_decode_table = _decode_table_cpu(self.group_k, self.direct_bf16_bits, self.output_rows)
+                self._cpu_decode_table = _decode_table_cpu(self.group_k, self.direct_bf16_bits, self.output_rows, self.cube_packed, self.unsigned_byte_cast)
             table = self._cpu_decode_table.to(device=device, non_blocking=False)
             try:
                 version = table._version
@@ -230,9 +257,14 @@ class AscendCTileCubeConsumer:
                 "AIV_to_small_GM_ring_to_L1_to_AIC": True,
                 "original_K32_blocks_per_Cube_tile": self.group_k,
                 "native_output_rows_per_tile": self.output_rows,
-                "source_checkpoint_tile_rows_unchanged": 16,
+                "source_checkpoint_tile_rows_unchanged": 16 if not self.cube_packed else False,
+                "source_checkpoint_files_unchanged": True,
+                "resident_encoding_changed": self.cube_packed,
+                "weight_format": self.weight_format,
+                "offline_Cube_order_removes_hot_NZ_weight_gather": self.cube_packed,
                 "activation_L1_preload_requested": self.preload_activation,
                 "direct_original_BF16_bit_decoder": self.direct_bf16_bits,
+                "exact_A2_unsigned_byte_to_half_indices": self.unsigned_byte_cast,
                 "immutable_decode_tables_prepared_once_per_device": self.prepared_decode_tables,
                 "decode_table_bytes_per_device": self.table_words * 4,
                 "decode_table_devices_prepared": [str(device) for device in self._decode_tables],
