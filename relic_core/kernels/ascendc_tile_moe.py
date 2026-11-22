@@ -45,14 +45,25 @@ class TileMoEWorkspace:
 
 
 def make_tile_moe_workspace(dim, inter_dim, topk, *, device, block_dim=24, group_k=1,
-                            weight_rows=16, max_bytes=512 * 2**20):
+                            weight_rows=16, max_bytes=512 * 2**20, compact_n64=False):
+    if not isinstance(compact_n64, bool):
+        raise ValueError("the compact N64 workspace policy must be an explicit boolean")
     for value in (dim, inter_dim, topk, block_dim, group_k, weight_rows, max_bytes):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError("tile workspace geometry and budget must be positive integers")
-    if (dim % 32 or inter_dim % 32 or topk > 8 or block_dim > 24 or group_k not in (1, 2, 4, 8)
-            or weight_rows not in (16, 32) or weight_rows * group_k > 128):
+    if compact_n64:
+        # Opt-in original N64/K128 layout: weight_rows 64 is the only new bank shape,
+        # and group_k 4 keeps the original K32 scale grid with no source-packet coalescing.
+        if weight_rows != 64 or group_k != 4 or dim % 128 or inter_dim % 128:
+            raise ValueError("compact N64 workspace requires explicit N64/K128 geometry and group_k=4")
+    elif weight_rows not in (16, 32) or weight_rows * group_k > 128:
         raise ValueError("unsupported original tile workspace geometry")
-    if dim % (32 * group_k) or inter_dim % (32 * group_k):
+    if dim % 32 or inter_dim % 32 or topk > 8 or block_dim > 24 or group_k not in (1, 2, 4, 8):
+        raise ValueError("unsupported original tile workspace geometry")
+    # The compact N64 workspace keeps the unchanged K128 source packets; every other
+    # geometry keeps its original K32-block grouping.
+    source_k = 128 if compact_n64 else 32 * group_k
+    if dim % source_k or inter_dim % source_k:
         raise ValueError("native tiles must retain complete original K32 blocks")
     required = (topk * 8 + (topk + 1) * 8 + 4 + block_dim * 128 * weight_rows * group_k
                 + topk * (2 * inter_dim + dim) * 4)

@@ -17,15 +17,48 @@ from .fast_fused_fp8_activation_decode import quantize_decode_fp8_fast
 from .tile_major_packed_gemv import unpack_tile_major
 
 CONTRACT = "original_fp4_expert_TP_FP32_down_reduce_before_BF16_ascending_expert_combine"
+#: The two measured compact formats this TP path may certify: N32 and N64, K128 source.
+SCALE_LUT_FORMATS = {"relic.fp4.cube-n32-k128.v1": 32, "relic.fp4.cube-n64-k128.v1": 64}
+
+
+def _require_scale_lut_certificate(consumer, backend, certified):
+    """Thread a real load-time range certificate, never infer one from tensor shape.
+
+    The default path is unchanged: an ordinary consumer (no bounded LUT metadata)
+    returns ``False`` and is called without the new keyword. Only the explicit
+    compact N32/N64 K128 group-4 consumer with the measured 117..127 range can
+    carry a certificate, and even then the caller must pass it explicitly.
+    """
+    if not isinstance(certified, bool):
+        raise ValueError("the scale-LUT operand certificate must be an explicit boolean")
+    bounds = (getattr(consumer, "scale_min", None), getattr(consumer, "scale_max", None))
+    if bounds == (None, None):
+        if certified:
+            raise ValueError("a scale-LUT certificate requires its explicitly bounded consumer")
+        return False
+    format_name = getattr(consumer, "weight_format", None)
+    if (backend != "triton" or not callable(consumer)
+            or any(type(value) is not int for value in bounds) or bounds != (117, 127)
+            or not isinstance(format_name, str) or format_name not in SCALE_LUT_FORMATS
+            or getattr(consumer, "cube_packed", False) is not True
+            or type(getattr(consumer, "group_k", None)) is not int or consumer.group_k != 4
+            or type(getattr(consumer, "output_rows", None)) is not int
+            or consumer.output_rows != SCALE_LUT_FORMATS[format_name]):
+        raise ValueError("scale-LUT TP requires the explicit compact N32/N64 K128 range contract")
+    if not certified:
+        raise ValueError("scale-LUT TP requires a load-time original E8M0 range certificate")
+    return True
 
 
 @torch.no_grad()
 def tp_moe_down_partials(x, weights, indices, banks, *, ep_rank, ep_world, n_experts,
-                         workspace, consumer=None, swiglu_limit=0.0, backend="triton"):
+                         workspace, consumer=None, swiglu_limit=0.0, backend="triton",
+                         certified_scale_lut_operands=False):
     """Compute one EP group's local intermediate slice, without narrowing down."""
     _validate(x, weights, indices, banks, workspace, ep_rank, ep_world, n_experts)
     if backend not in ("torch", "triton") or not math.isfinite(swiglu_limit) or swiglu_limit < 0:
         raise ValueError("expert TP requires an explicit backend and finite nonnegative clamp")
+    use_scale_lut = _require_scale_lut_certificate(consumer, backend, certified_scale_lut_operands)
     activation = quantize_decode_fp8_fast(x, backend=backend)
     if backend == "torch":
         if x.device.type != "cpu":
@@ -42,6 +75,10 @@ def tp_moe_down_partials(x, weights, indices, banks, *, ep_rank, ep_world, n_exp
         _triton_routes(indices, weights, rank=ep_rank, world=ep_world,
                        n_experts=n_experts, workspace=workspace)
         options = dict(world=ep_world, certified_bf16_operands=True, scratch=workspace.weight_storage)
+        if use_scale_lut:
+            # The model loader checked every original E8M0 byte before installing
+            # these banks; this explicit flag forwards that certificate only.
+            options["certified_scale_lut_operands"] = True
         gate = consumer(activation, *banks["w1"], workspace.selected,
                         accumulation=workspace.gate_accumulation, **options)
         up = consumer(activation, *banks["w3"], workspace.selected,
