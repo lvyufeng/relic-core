@@ -83,8 +83,14 @@ constexpr uint32_t ESOFF_OFF = SOFF_OFF + SCALE_COUNT * sizeof(uint32_t);
 constexpr uint32_t OUT_OFF = ESOFF_OFF + BYTES * sizeof(int32_t);
 constexpr uint32_t INVALID_OFF = OUT_OFF + 2 * ELEMENTS * sizeof(bfloat16_t);
 constexpr uint32_t UB_BYTES = INVALID_OFF + N * sizeof(float);
-static_assert(UB_BYTES <= 128 * 1024,
-              "the complete Vector decode scratch must fit the Ascend910B Unified Buffer");
+// Second raw/scale slot, appended after the existing scratch so every offset above stays
+// byte-identical. The pipelined loop prefetches block b+1 into the slot the vector unit is not
+// reading, which is what lets the 4 KB packed load overlap the decode instead of preceding it.
+constexpr uint32_t RAW2_OFF = UB_BYTES;
+constexpr uint32_t SCL2_OFF = RAW2_OFF + BYTES;
+constexpr uint32_t UB_TOTAL = SCL2_OFF + SCALE_PAD;
+static_assert(UB_TOTAL <= 128 * 1024,
+              "the pipelined Vector decode scratch must fit the Ascend910B Unified Buffer");
 
 constexpr uint32_t L1_B_SLOT_BYTES = ELEMENTS * sizeof(bfloat16_t);
 constexpr uint32_t L1_A_OFFSET = 2 * L1_B_SLOT_BYTES;
@@ -127,6 +133,8 @@ public:
         world_ = world;
         raw_ = LocalTensor<uint8_t>(TPosition::VECCALC, RAW_OFF, BYTES);
         scaleBytes_ = LocalTensor<uint8_t>(TPosition::VECCALC, SCL_OFF, SCALE_PAD);
+        rawNext_ = LocalTensor<uint8_t>(TPosition::VECCALC, RAW2_OFF, BYTES);
+        scaleBytesNext_ = LocalTensor<uint8_t>(TPosition::VECCALC, SCL2_OFF, SCALE_PAD);
         codeHalf_ = LocalTensor<half>(TPosition::VECCALC, CHALF_OFF, BYTES);
         codeIdx_ = LocalTensor<int32_t>(TPosition::VECCALC, CIDX_OFF, BYTES);
         scaleHalf_ = LocalTensor<half>(TPosition::VECCALC, SHALF_OFF, SCALE_COUNT);
@@ -185,25 +193,37 @@ public:
             }
             const uint32_t local = expert / world_;
             const uint64_t base = (static_cast<uint64_t>(local) * tiles_ + tile) * blocks_;
+            // Fetch block 0 before the loop; each iteration then issues the next block's load into
+            // the idle slot *before* decoding the current one, so the packed read overlaps the
+            // vector decode instead of preceding it.
+            DataCopy(raw_, packed_[base * BYTES], BYTES);
+            DataCopyPad(scaleBytes_, scales_[base * SCALE_COUNT],
+                        DataCopyExtParams{1, SCALE_COUNT, 0, 0, 0},
+                        DataCopyPadExtParams<uint8_t>{false, 0, 0, 0});
+            SetFlag<HardEvent::MTE2_V>(0);
             for (uint32_t block = 0; block < blocks_; ++block) {
                 const uint32_t slot = block & 1;
                 if (block >= 2) CrossCoreWaitFlag<0x2>(FREE_FLAG + slot);
                 // The offline compact layout already matches Mmad K16-major/N16-minor B, and the
                 // scale bank stays one original byte per N row and K32 block.
-                const uint64_t source = base + block;
-                DataCopy(raw_, packed_[source * BYTES], BYTES);
-                DataCopyPad(scaleBytes_, scales_[source * SCALE_COUNT],
-                            DataCopyExtParams{1, SCALE_COUNT, 0, 0, 0},
-                            DataCopyPadExtParams<uint8_t>{false, 0, 0, 0});
-                SetFlag<HardEvent::MTE2_S>(0);
-                WaitFlag<HardEvent::MTE2_S>(0);
-                SetFlag<HardEvent::MTE2_V>(0);
                 WaitFlag<HardEvent::MTE2_V>(0);
+                LocalTensor<uint8_t> rawNow = slot == 0 ? raw_ : rawNext_;
+                LocalTensor<uint8_t> scaleNow = slot == 0 ? scaleBytes_ : scaleBytesNext_;
+                LocalTensor<uint8_t> rawAhead = slot == 0 ? rawNext_ : raw_;
+                LocalTensor<uint8_t> scaleAhead = slot == 0 ? scaleBytesNext_ : scaleBytes_;
+                if (block + 1 < blocks_) {
+                    const uint64_t nextSource = base + block + 1;
+                    DataCopy(rawAhead, packed_[nextSource * BYTES], BYTES);
+                    DataCopyPad(scaleAhead, scales_[nextSource * SCALE_COUNT],
+                                DataCopyExtParams{1, SCALE_COUNT, 0, 0, 0},
+                                DataCopyPadExtParams<uint8_t>{false, 0, 0, 0});
+                    SetFlag<HardEvent::MTE2_V>(0);
+                }
 
                 // Packed byte -> byte offset of that byte's word inside a LUT slot. The cast is the
                 // proven A2 unsigned widening (uint8 -> half -> int32); it only ever moves an index,
                 // never a weight value, so no rounding can appear in the decoded result.
-                Cast(codeHalf_, raw_, RoundMode::CAST_NONE, BYTES);
+                Cast(codeHalf_, rawNow, RoundMode::CAST_NONE, BYTES);
                 PipeBarrier<PIPE_V>();
                 Cast(codeIdx_, codeHalf_, RoundMode::CAST_RINT, BYTES);
                 PipeBarrier<PIPE_V>();
@@ -214,7 +234,7 @@ public:
                 // Original scale byte -> byte offset of its LUT slot. The prepared map already folds
                 // the measured 117..127 window and the poison slot, so an out-of-range byte can only
                 // ever reach NaN pairs.
-                Cast(scaleHalf_, scaleBytes_, RoundMode::CAST_NONE, SCALE_COUNT);
+                Cast(scaleHalf_, scaleNow, RoundMode::CAST_NONE, SCALE_COUNT);
                 PipeBarrier<PIPE_V>();
                 Cast(scaleIdx_, scaleHalf_, RoundMode::CAST_RINT, SCALE_COUNT);
                 PipeBarrier<PIPE_V>();
@@ -224,10 +244,28 @@ public:
                 Gather(slotOff_, scaleMap_, scaleIdx_.ReinterpretCast<uint32_t>(),
                        static_cast<uint32_t>(0), SCALE_COUNT);
                 PipeBarrier<PIPE_V>();
-                // One scale covers a whole K32 row, i.e. sixteen packed bytes. The prepared repeat
-                // table expands that to one offset per pair in Cube K16-major/N16-minor order, so
-                // the decoded tile needs no separate N32-to-panel rearrangement.
-                Gather(expandedSlot_, slotOff_, pairRepeat_, static_cast<uint32_t>(0), BYTES);
+                // One scale covers a whole K32 row, i.e. sixteen packed bytes, and the decoded tile
+                // needs one offset per pair in Cube K16-major/N16-minor order. That pattern is fixed:
+                // each of the N group offsets repeats eight times and the resulting N*8 words fill the
+                // group twice. A general Gather pays per-element offset work on the scalar unit for a
+                // pattern that is a plain broadcast, so the vector broadcast instruction emits it
+                // instead. The offsets themselves are identical, which is what keeps the decoded bytes
+                // unchanged.
+                // One repeat always consumes eight source words and writes eight 32B destination
+                // blocks (sixty-four 32-bit words) whatever N is, so the destination repeat stride
+                // is a constant eight blocks. Deriving it from N is only accidentally right at
+                // N = 64 and would pack the N = 32 geometry wrongly.
+                // Only dstBlkStride and dstRepStride reach the hardware instruction; the source
+                // advance is implicit consecutive consumption of eight words per repeat, so no
+                // source stride is configured here.
+                BrcbRepeatParams broadcast(1, 8);
+                for (uint32_t quadrant = 0; quadrant < GROUP_K; ++quadrant) {
+                    const uint32_t from = quadrant * N;
+                    const uint32_t to = quadrant * N * 16;
+                    Brcb(expandedSlot_[to], slotOff_[from], static_cast<uint8_t>(N / 8), broadcast);
+                    Brcb(expandedSlot_[to + N * 8], slotOff_[from], static_cast<uint8_t>(N / 8),
+                         broadcast);
+                }
                 PipeBarrier<PIPE_V>();
 
                 Add(codeIdx_, codeIdx_, expandedSlot_.ReinterpretCast<int32_t>(), BYTES);
@@ -260,7 +298,7 @@ public:
     }
 
 private:
-    LocalTensor<uint8_t> raw_, scaleBytes_;
+    LocalTensor<uint8_t> raw_, scaleBytes_, rawNext_, scaleBytesNext_;
     LocalTensor<half> codeHalf_, scaleHalf_;
     LocalTensor<int32_t> codeIdx_, scaleIdx_;
     LocalTensor<uint32_t> slotOff_, expandedSlot_, codeLut_, scaleMap_, pairRepeat_;
