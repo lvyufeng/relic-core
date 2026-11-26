@@ -224,10 +224,28 @@ public:
                 Gather(slotOff_, scaleMap_, scaleIdx_.ReinterpretCast<uint32_t>(),
                        static_cast<uint32_t>(0), SCALE_COUNT);
                 PipeBarrier<PIPE_V>();
-                // One scale covers a whole K32 row, i.e. sixteen packed bytes. The prepared repeat
-                // table expands that to one offset per pair in Cube K16-major/N16-minor order, so
-                // the decoded tile needs no separate N32-to-panel rearrangement.
-                Gather(expandedSlot_, slotOff_, pairRepeat_, static_cast<uint32_t>(0), BYTES);
+                // One scale covers a whole K32 row, i.e. sixteen packed bytes, and the decoded tile
+                // needs one offset per pair in Cube K16-major/N16-minor order. That pattern is fixed:
+                // each of the N group offsets repeats eight times and the resulting N*8 words fill the
+                // group twice. A general Gather pays per-element offset work on the scalar unit for a
+                // pattern that is a plain broadcast, so the vector broadcast instruction emits it
+                // instead. The offsets themselves are identical, which is what keeps the decoded bytes
+                // unchanged.
+                // One repeat always consumes eight source words and writes eight 32B destination
+                // blocks (sixty-four 32-bit words) whatever N is, so the destination repeat stride
+                // is a constant eight blocks. Deriving it from N is only accidentally right at
+                // N = 64 and would pack the N = 32 geometry wrongly.
+                // Only dstBlkStride and dstRepStride reach the hardware instruction; the source
+                // advance is implicit consecutive consumption of eight words per repeat, so no
+                // source stride is configured here.
+                BrcbRepeatParams broadcast(1, 8);
+                for (uint32_t quadrant = 0; quadrant < GROUP_K; ++quadrant) {
+                    const uint32_t from = quadrant * N;
+                    const uint32_t to = quadrant * N * 16;
+                    Brcb(expandedSlot_[to], slotOff_[from], static_cast<uint8_t>(N / 8), broadcast);
+                    Brcb(expandedSlot_[to + N * 8], slotOff_[from], static_cast<uint8_t>(N / 8),
+                         broadcast);
+                }
                 PipeBarrier<PIPE_V>();
 
                 Add(codeIdx_, codeIdx_, expandedSlot_.ReinterpretCast<int32_t>(), BYTES);
